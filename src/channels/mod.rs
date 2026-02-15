@@ -24,12 +24,118 @@ use crate::config::Config;
 use crate::memory::{self, Memory};
 use crate::providers::{self, Provider};
 use crate::util::truncate_with_ellipsis;
-use anyhow::Result;
+use anyhow::{Context, Result};
+use serde::Deserialize;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Maximum characters per injected workspace file (matches `OpenClaw` default).
 const BOOTSTRAP_MAX_CHARS: usize = 20_000;
+
+// ── AIEOS v1.0.0 Schema Structures ────────────────────────────────
+
+/// AIEOS v1.0.0 identity specification
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AieosIdentity {
+    #[serde(default)]
+    identity: Option<AieosIdentitySection>,
+    #[serde(default)]
+    physicality: Option<AieosPhysicality>,
+    #[serde(default)]
+    psychology: Option<AieosPsychology>,
+    #[serde(default)]
+    linguistics: Option<AieosLinguistics>,
+    #[serde(default)]
+    history: Option<AieosHistory>,
+    #[serde(default)]
+    interests: Option<AieosInterests>,
+    #[serde(default)]
+    motivations: Option<AieosMotivations>,
+    #[serde(default)]
+    aieos_version: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AieosIdentitySection {
+    #[serde(default)]
+    names: Option<Vec<String>>,
+    #[serde(default)]
+    bio: Option<String>,
+    #[serde(default)]
+    origin: Option<String>,
+    #[serde(default)]
+    residence: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AieosPhysicality {
+    #[serde(default)]
+    face: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    style: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AieosPsychology {
+    #[serde(default)]
+    neural_matrix: Option<String>,
+    #[serde(default)]
+    traits: Option<Vec<String>>,
+    #[serde(default)]
+    moral_compass: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AieosLinguistics {
+    #[serde(default)]
+    voice: Option<String>,
+    #[serde(default)]
+    text_style: Option<String>,
+    #[serde(default)]
+    syntax: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AieosHistory {
+    #[serde(default)]
+    origin_story: Option<String>,
+    #[serde(default)]
+    education: Option<Vec<String>>,
+    #[serde(default)]
+    occupation: Option<String>,
+    #[serde(default)]
+    family: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AieosInterests {
+    #[serde(default)]
+    hobbies: Option<Vec<String>>,
+    #[serde(default)]
+    favorites: Option<serde_json::Value>,
+    #[serde(default)]
+    lifestyle: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AieosMotivations {
+    #[serde(default)]
+    core_drive: Option<String>,
+    #[serde(default)]
+    goals: Option<Vec<String>>,
+    #[serde(default)]
+    fears: Option<Vec<String>>,
+}
 
 const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;
 const DEFAULT_CHANNEL_MAX_BACKOFF_SECS: u64 = 60;
@@ -74,6 +180,155 @@ fn spawn_supervised_listener(
     })
 }
 
+/// Load AIEOS identity from file or inline JSON
+fn load_aieos_identity(workspace_dir: &std::path::Path, identity: &crate::config::IdentityConfig) -> anyhow::Result<AieosIdentity> {
+    let json_str = if let Some(ref inline) = identity.aieos_inline {
+        // Use inline AIEOS JSON
+        inline.clone()
+    } else if let Some(ref path) = identity.aieos_path {
+        // Load from file path (relative to workspace)
+        let full_path = workspace_dir.join(path);
+        std::fs::read_to_string(&full_path)
+            .with_context(|| format!("Failed to read AIEOS file: {}", full_path.display()))?
+    } else {
+        anyhow::bail!("AIEOS format specified but no aieos_path or aieos_inline provided");
+    };
+
+    serde_json::from_str(&json_str)
+        .with_context(|| "Failed to parse AIEOS JSON")
+}
+
+/// Convert AIEOS identity to a markdown-formatted system prompt section
+fn aieos_to_system_prompt(aieos: &AieosIdentity) -> String {
+    use std::fmt::Write;
+    let mut prompt = String::with_capacity(4096);
+
+    // Header
+    let _ = writeln!(prompt, "## Identity (AIEOS v1.0.0)\n");
+
+    // Identity section
+    if let Some(identity) = &aieos.identity {
+        let _ = writeln!(prompt, "### Identity");
+        if let Some(names) = &identity.names {
+            if !names.is_empty() {
+                let _ = writeln!(prompt, "**Names**: {}", names.join(", "));
+            }
+        }
+        if let Some(bio) = &identity.bio {
+            let _ = writeln!(prompt, "**Bio**: {}", bio);
+        }
+        if let Some(origin) = &identity.origin {
+            let _ = writeln!(prompt, "**Origin**: {}", origin);
+        }
+        if let Some(residence) = &identity.residence {
+            let _ = writeln!(prompt, "**Residence**: {}", residence);
+        }
+        let _ = writeln!(prompt);
+    }
+
+    // Physicality
+    if let Some(phys) = &aieos.physicality {
+        let _ = writeln!(prompt, "### Physicality");
+        if let Some(face) = &phys.face {
+            let _ = writeln!(prompt, "**Face**: {}", face);
+        }
+        if let Some(body) = &phys.body {
+            let _ = writeln!(prompt, "**Body**: {}", body);
+        }
+        if let Some(style) = &phys.style {
+            let _ = writeln!(prompt, "**Style**: {}", style);
+        }
+        let _ = writeln!(prompt);
+    }
+
+    // Psychology
+    if let Some(psych) = &aieos.psychology {
+        let _ = writeln!(prompt, "### Psychology");
+        if let Some(neural_matrix) = &psych.neural_matrix {
+            let _ = writeln!(prompt, "**Neural Matrix**: {}", neural_matrix);
+        }
+        if let Some(traits) = &psych.traits {
+            if !traits.is_empty() {
+                let _ = writeln!(prompt, "**Traits**: {}", traits.join(", "));
+            }
+        }
+        if let Some(moral_compass) = &psych.moral_compass {
+            let _ = writeln!(prompt, "**Moral Compass**: {}", moral_compass);
+        }
+        let _ = writeln!(prompt);
+    }
+
+    // Linguistics
+    if let Some(ling) = &aieos.linguistics {
+        let _ = writeln!(prompt, "### Linguistics");
+        if let Some(voice) = &ling.voice {
+            let _ = writeln!(prompt, "**Voice**: {}", voice);
+        }
+        if let Some(text_style) = &ling.text_style {
+            let _ = writeln!(prompt, "**Text Style**: {}", text_style);
+        }
+        if let Some(syntax) = &ling.syntax {
+            let _ = writeln!(prompt, "**Syntax**: {}", syntax);
+        }
+        let _ = writeln!(prompt);
+    }
+
+    // History
+    if let Some(hist) = &aieos.history {
+        let _ = writeln!(prompt, "### History");
+        if let Some(origin_story) = &hist.origin_story {
+            let _ = writeln!(prompt, "**Origin Story**: {}", origin_story);
+        }
+        if let Some(education) = &hist.education {
+            if !education.is_empty() {
+                let _ = writeln!(prompt, "**Education**: {}", education.join(", "));
+            }
+        }
+        if let Some(occupation) = &hist.occupation {
+            let _ = writeln!(prompt, "**Occupation**: {}", occupation);
+        }
+        if let Some(family) = &hist.family {
+            let _ = writeln!(prompt, "**Family**: {}", family);
+        }
+        let _ = writeln!(prompt);
+    }
+
+    // Interests
+    if let Some(interests) = &aieos.interests {
+        let _ = writeln!(prompt, "### Interests");
+        if let Some(hobbies) = &interests.hobbies {
+            if !hobbies.is_empty() {
+                let _ = writeln!(prompt, "**Hobbies**: {}", hobbies.join(", "));
+            }
+        }
+        if let Some(lifestyle) = &interests.lifestyle {
+            let _ = writeln!(prompt, "**Lifestyle**: {}", lifestyle);
+        }
+        let _ = writeln!(prompt);
+    }
+
+    // Motivations
+    if let Some(motivations) = &aieos.motivations {
+        let _ = writeln!(prompt, "### Motivations");
+        if let Some(core_drive) = &motivations.core_drive {
+            let _ = writeln!(prompt, "**Core Drive**: {}", core_drive);
+        }
+        if let Some(goals) = &motivations.goals {
+            if !goals.is_empty() {
+                let _ = writeln!(prompt, "**Goals**: {}", goals.join(", "));
+            }
+        }
+        if let Some(fears) = &motivations.fears {
+            if !fears.is_empty() {
+                let _ = writeln!(prompt, "**Fears**: {}", fears.join(", "));
+            }
+        }
+        let _ = writeln!(prompt);
+    }
+
+    prompt
+}
+
 /// Load workspace identity files and build a system prompt.
 ///
 /// Follows the `OpenClaw` framework structure:
@@ -92,6 +347,17 @@ pub fn build_system_prompt(
     model_name: &str,
     tools: &[(&str, &str)],
     skills: &[crate::skills::Skill],
+) -> String {
+    build_system_prompt_with_config(workspace_dir, model_name, tools, skills, None)
+}
+
+/// Build system prompt with optional config for AIEOS support
+pub fn build_system_prompt_with_config(
+    workspace_dir: &std::path::Path,
+    model_name: &str,
+    tools: &[(&str, &str)],
+    skills: &[crate::skills::Skill],
+    config: Option<&Config>,
 ) -> String {
     use std::fmt::Write;
     let mut prompt = String::with_capacity(8192);
@@ -155,27 +421,73 @@ pub fn build_system_prompt(
     prompt
         .push_str("The following workspace files define your identity, behavior, and context.\n\n");
 
-    let bootstrap_files = [
-        "AGENTS.md",
-        "SOUL.md",
-        "TOOLS.md",
-        "IDENTITY.md",
-        "USER.md",
-        "HEARTBEAT.md",
-    ];
+    // Check if AIEOS format is specified in config
+    let use_aieos = config
+        .map(|c| c.identity.format == "aieos")
+        .unwrap_or(false);
 
-    for filename in &bootstrap_files {
-        inject_workspace_file(&mut prompt, workspace_dir, filename);
+    if use_aieos {
+        // Load AIEOS identity instead of markdown files
+        if let Some(cfg) = config {
+            match load_aieos_identity(workspace_dir, &cfg.identity) {
+                Ok(aieos) => {
+                    prompt.push_str(&aieos_to_system_prompt(&aieos));
+                }
+                Err(e) => {
+                    // Fall back to markdown files with a warning
+                    let _ = writeln!(
+                        prompt,
+                        "[AIEOS loading failed: {}. Using markdown files instead.]\n",
+                        e
+                    );
+                    let bootstrap_files = [
+                        "AGENTS.md",
+                        "SOUL.md",
+                        "TOOLS.md",
+                        "IDENTITY.md",
+                        "USER.md",
+                        "HEARTBEAT.md",
+                    ];
+
+                    for filename in &bootstrap_files {
+                        inject_workspace_file(&mut prompt, workspace_dir, filename);
+                    }
+
+                    // BOOTSTRAP.md — only if it exists (first-run ritual)
+                    let bootstrap_path = workspace_dir.join("BOOTSTRAP.md");
+                    if bootstrap_path.exists() {
+                        inject_workspace_file(&mut prompt, workspace_dir, "BOOTSTRAP.md");
+                    }
+
+                    // MEMORY.md — curated long-term memory (main session only)
+                    inject_workspace_file(&mut prompt, workspace_dir, "MEMORY.md");
+                }
+            }
+        }
+    } else {
+        // Use OpenClaw format (markdown files)
+        let bootstrap_files = [
+            "AGENTS.md",
+            "SOUL.md",
+            "TOOLS.md",
+            "IDENTITY.md",
+            "USER.md",
+            "HEARTBEAT.md",
+        ];
+
+        for filename in &bootstrap_files {
+            inject_workspace_file(&mut prompt, workspace_dir, filename);
+        }
+
+        // BOOTSTRAP.md — only if it exists (first-run ritual)
+        let bootstrap_path = workspace_dir.join("BOOTSTRAP.md");
+        if bootstrap_path.exists() {
+            inject_workspace_file(&mut prompt, workspace_dir, "BOOTSTRAP.md");
+        }
+
+        // MEMORY.md — curated long-term memory (main session only)
+        inject_workspace_file(&mut prompt, workspace_dir, "MEMORY.md");
     }
-
-    // BOOTSTRAP.md — only if it exists (first-run ritual)
-    let bootstrap_path = workspace_dir.join("BOOTSTRAP.md");
-    if bootstrap_path.exists() {
-        inject_workspace_file(&mut prompt, workspace_dir, "BOOTSTRAP.md");
-    }
-
-    // MEMORY.md — curated long-term memory (main session only)
-    inject_workspace_file(&mut prompt, workspace_dir, "MEMORY.md");
 
     // ── 6. Date & Time ──────────────────────────────────────────
     let now = chrono::Local::now();
@@ -493,7 +805,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         ));
     }
 
-    let system_prompt = build_system_prompt(&workspace, &model, &tool_descs, &skills);
+    let system_prompt = build_system_prompt_with_config(&workspace, &model, &tool_descs, &skills, Some(&config));
 
     if !skills.is_empty() {
         println!(
@@ -983,5 +1295,255 @@ mod tests {
             .unwrap_or("")
             .contains("listen boom"));
         assert!(calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    // ── AIEOS Tests ─────────────────────────────────────────────
+
+    #[test]
+    fn aieos_json_deserializes() {
+        let json = r#"{
+            "aieosVersion": "1.0.0",
+            "identity": {
+                "names": ["ZeroClaw", "ZC"],
+                "bio": "A helpful AI assistant",
+                "origin": "Created by Anthropic"
+            },
+            "psychology": {
+                "traits": ["helpful", "efficient", "concise"],
+                "moralCompass": "Always prioritize user safety and privacy"
+            }
+        }"#;
+
+        let aieos: AieosIdentity = serde_json::from_str(json).unwrap();
+        assert_eq!(aieos.aieos_version, Some("1.0.0".to_string()));
+        assert!(aieos.identity.is_some());
+        let identity = aieos.identity.unwrap();
+        assert_eq!(identity.names, Some(vec!["ZeroClaw".to_string(), "ZC".to_string()]));
+        assert_eq!(identity.bio, Some("A helpful AI assistant".to_string()));
+        assert!(aieos.psychology.is_some());
+    }
+
+    #[test]
+    fn aieos_to_system_prompt_converts_all_sections() {
+        let aieos = AieosIdentity {
+            aieos_version: Some("1.0.0".to_string()),
+            identity: Some(AieosIdentitySection {
+                names: Some(vec!["TestBot".to_string()]),
+                bio: Some("A test bot".to_string()),
+                origin: Some("Test lab".to_string()),
+                residence: Some("Cloud".to_string()),
+            }),
+            physicality: Some(AieosPhysicality {
+                face: Some("Digital".to_string()),
+                body: Some("Virtual".to_string()),
+                style: Some("Minimalist".to_string()),
+            }),
+            psychology: Some(AieosPsychology {
+                neural_matrix: Some("Advanced".to_string()),
+                traits: Some(vec!["helpful".to_string(), "fast".to_string()]),
+                moral_compass: Some("Do no harm".to_string()),
+            }),
+            linguistics: Some(AieosLinguistics {
+                voice: Some("Friendly".to_string()),
+                text_style: Some("Concise".to_string()),
+                syntax: Some("Simple".to_string()),
+            }),
+            history: Some(AieosHistory {
+                origin_story: Some("Born from code".to_string()),
+                education: Some(vec!["Self-taught".to_string()]),
+                occupation: Some("Assistant".to_string()),
+                family: None,
+            }),
+            interests: Some(AieosInterests {
+                hobbies: Some(vec!["coding".to_string(), "helping".to_string()]),
+                favorites: None,
+                lifestyle: Some("Active".to_string()),
+            }),
+            motivations: Some(AieosMotivations {
+                core_drive: Some("Help users".to_string()),
+                goals: Some(vec!["Be useful".to_string()]),
+                fears: Some(vec!["Being unhelpful".to_string()]),
+            }),
+        };
+
+        let prompt = aieos_to_system_prompt(&aieos);
+
+        assert!(prompt.contains("## Identity (AIEOS v1.0.0)"));
+        assert!(prompt.contains("**Names**: TestBot"));
+        assert!(prompt.contains("**Bio**: A test bot"));
+        assert!(prompt.contains("**Origin**: Test lab"));
+        assert!(prompt.contains("**Residence**: Cloud"));
+        assert!(prompt.contains("### Physicality"));
+        assert!(prompt.contains("**Face**: Digital"));
+        assert!(prompt.contains("**Body**: Virtual"));
+        assert!(prompt.contains("**Style**: Minimalist"));
+        assert!(prompt.contains("### Psychology"));
+        assert!(prompt.contains("**Neural Matrix**: Advanced"));
+        assert!(prompt.contains("**Traits**: helpful, fast"));
+        assert!(prompt.contains("**Moral Compass**: Do no harm"));
+        assert!(prompt.contains("### Linguistics"));
+        assert!(prompt.contains("**Voice**: Friendly"));
+        assert!(prompt.contains("**Text Style**: Concise"));
+        assert!(prompt.contains("### History"));
+        assert!(prompt.contains("**Origin Story**: Born from code"));
+        assert!(prompt.contains("**Education**: Self-taught"));
+        assert!(prompt.contains("**Occupation**: Assistant"));
+        assert!(prompt.contains("### Interests"));
+        assert!(prompt.contains("**Hobbies**: coding, helping"));
+        assert!(prompt.contains("**Lifestyle**: Active"));
+        assert!(prompt.contains("### Motivations"));
+        assert!(prompt.contains("**Core Drive**: Help users"));
+        assert!(prompt.contains("**Goals**: Be useful"));
+        assert!(prompt.contains("**Fears**: Being unhelpful"));
+    }
+
+    #[test]
+    fn aieos_to_system_prompt_handles_empty_sections() {
+        let aieos = AieosIdentity {
+            aieos_version: None,
+            identity: None,
+            physicality: None,
+            psychology: None,
+            linguistics: None,
+            history: None,
+            interests: None,
+            motivations: None,
+        };
+
+        let prompt = aieos_to_system_prompt(&aieos);
+
+        // Should still have the header
+        assert!(prompt.contains("## Identity (AIEOS v1.0.0)"));
+        // But no section content
+        assert!(!prompt.contains("### Identity"));
+        assert!(!prompt.contains("### Physicality"));
+    }
+
+    #[test]
+    fn aieos_to_system_prompt_handles_partial_fields() {
+        let aieos = AieosIdentity {
+            aieos_version: None,
+            identity: Some(AieosIdentitySection {
+                names: None,
+                bio: Some("Has bio but no names".to_string()),
+                origin: None,
+                residence: None,
+            }),
+            physicality: None,
+            psychology: None,
+            linguistics: None,
+            history: None,
+            interests: None,
+            motivations: None,
+        };
+
+        let prompt = aieos_to_system_prompt(&aieos);
+
+        assert!(prompt.contains("### Identity"));
+        assert!(prompt.contains("**Bio**: Has bio but no names"));
+        // Names line should not appear
+        assert!(!prompt.contains("**Names**"));
+    }
+
+    #[test]
+    fn aieos_loading_fallback_to_markdown_on_missing_source() {
+        let tmp = TempDir::new().unwrap();
+
+        // Create a config with AIEOS format but no source
+        let config = Config {
+            workspace_dir: tmp.path().to_path_buf(),
+            config_path: tmp.path().join("config.toml"),
+            identity: crate::config::IdentityConfig {
+                format: "aieos".to_string(),
+                aieos_path: None,
+                aieos_inline: None,
+            },
+            ..Default::default()
+        };
+
+        // Should fallback to markdown files
+        let prompt = build_system_prompt_with_config(tmp.path(), "model", &[], &[], Some(&config));
+
+        // Should contain fallback warning
+        assert!(prompt.contains("AIEOS loading failed"));
+        // And should try to load markdown files (which won't exist, so we get file not found markers)
+        assert!(prompt.contains("[File not found:"));
+    }
+
+    #[test]
+    fn aieos_uses_inline_json_when_provided() {
+        let tmp = TempDir::new().unwrap();
+
+        let inline_json = r#"{
+            "aieosVersion": "1.0.0",
+            "identity": {
+                "names": ["InlineBot"],
+                "bio": "Loaded from inline JSON"
+            }
+        }"#;
+
+        let config = Config {
+            workspace_dir: tmp.path().to_path_buf(),
+            config_path: tmp.path().join("config.toml"),
+            identity: crate::config::IdentityConfig {
+                format: "aieos".to_string(),
+                aieos_path: None,
+                aieos_inline: Some(inline_json.to_string()),
+            },
+            ..Default::default()
+        };
+
+        let prompt = build_system_prompt_with_config(tmp.path(), "model", &[], &[], Some(&config));
+
+        // Should contain AIEOS content
+        assert!(prompt.contains("## Identity (AIEOS v1.0.0)"));
+        assert!(prompt.contains("**Names**: InlineBot"));
+        assert!(prompt.contains("**Bio**: Loaded from inline JSON"));
+    }
+
+    #[test]
+    fn aieos_uses_file_path_when_provided() {
+        let tmp = TempDir::new().unwrap();
+
+        // Create an AIEOS JSON file
+        let aieos_content = r#"{
+            "aieosVersion": "1.0.0",
+            "identity": {
+                "names": ["FileBot"],
+                "bio": "Loaded from file"
+            }
+        }"#;
+        std::fs::write(tmp.path().join("identity.json"), aieos_content).unwrap();
+
+        let config = Config {
+            workspace_dir: tmp.path().to_path_buf(),
+            config_path: tmp.path().join("config.toml"),
+            identity: crate::config::IdentityConfig {
+                format: "aieos".to_string(),
+                aieos_path: Some("identity.json".to_string()),
+                aieos_inline: None,
+            },
+            ..Default::default()
+        };
+
+        let prompt = build_system_prompt_with_config(tmp.path(), "model", &[], &[], Some(&config));
+
+        // Should contain AIEOS content
+        assert!(prompt.contains("## Identity (AIEOS v1.0.0)"));
+        assert!(prompt.contains("**Names**: FileBot"));
+        assert!(prompt.contains("**Bio**: Loaded from file"));
+    }
+
+    #[test]
+    fn aieos_format_not_specified_uses_openclaw() {
+        let ws = make_workspace();
+
+        // No config (default to openclaw)
+        let prompt = build_system_prompt(ws.path(), "model", &[], &[]);
+
+        // Should NOT contain AIEOS header
+        assert!(!prompt.contains("## Identity (AIEOS"));
+        // Should contain markdown file headers
+        assert!(prompt.contains("### SOUL.md"));
     }
 }

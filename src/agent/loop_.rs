@@ -124,11 +124,12 @@ pub async fn run(
             "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run, 'connect' to OAuth.",
         ));
     }
-    let system_prompt = crate::channels::build_system_prompt(
+    let system_prompt = crate::channels::build_system_prompt_with_config(
         &config.workspace_dir,
         model_name,
         &tool_descs,
         &skills,
+        Some(&config),
     );
 
     // ── Execute ──────────────────────────────────────────────────
