@@ -9,10 +9,7 @@ use std::sync::Arc;
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum ClientMessage {
-    Message {
-        content: String,
-        session_id: String,
-    },
+    Message { content: String, session_id: String },
     NewSession,
 }
 
@@ -20,17 +17,10 @@ pub enum ClientMessage {
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum ServerMessage {
-    Message {
-        content: String,
-        session_id: String,
-    },
-    SessionCreated {
-        session_id: String,
-    },
+    Message { content: String, session_id: String },
+    SessionCreated { session_id: String },
     Typing,
-    Error {
-        content: String,
-    },
+    Error { content: String },
 }
 
 impl ServerMessage {
@@ -77,10 +67,7 @@ pub async fn handle_ws(
                     Ok(session_id) => {
                         // Add system prompt to the new session
                         let _ = sessions
-                            .add_message(
-                                &session_id,
-                                ChatMessage::system(system_prompt.clone()),
-                            )
+                            .add_message(&session_id, ChatMessage::system(system_prompt.clone()))
                             .await;
                         let _ = sender
                             .send(ServerMessage::SessionCreated { session_id }.to_text())
@@ -123,10 +110,8 @@ pub async fn handle_ws(
                                     .await;
                                 let _ = sender
                                     .send(
-                                        ServerMessage::SessionCreated {
-                                            session_id: new_id,
-                                        }
-                                        .to_text(),
+                                        ServerMessage::SessionCreated { session_id: new_id }
+                                            .to_text(),
                                     )
                                     .await;
                                 continue;
@@ -166,7 +151,10 @@ pub async fn handle_ws(
                     }
                 };
 
-                match provider.chat_with_history(&history, &model, temperature).await {
+                match provider
+                    .chat_with_history(&history, &model, temperature)
+                    .await
+                {
                     Ok(response) => {
                         // Add assistant response to history
                         let _ = sessions

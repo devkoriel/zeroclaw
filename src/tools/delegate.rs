@@ -43,14 +43,8 @@ impl Tool for DelegateTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let agent_name = args["agent"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        let message = args["message"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
+        let agent_name = args["agent"].as_str().unwrap_or("").to_string();
+        let message = args["message"].as_str().unwrap_or("").to_string();
 
         let agent_config = match self.agents.get(&agent_name) {
             Some(c) => c,
@@ -72,8 +66,7 @@ impl Tool for DelegateTool {
             .as_deref()
             .or(self.fallback_api_key.as_deref());
 
-        let provider =
-            crate::providers::create_provider(&agent_config.provider, api_key)?;
+        let provider = crate::providers::create_provider(&agent_config.provider, api_key)?;
 
         let temperature = agent_config.temperature.unwrap_or(0.7);
 

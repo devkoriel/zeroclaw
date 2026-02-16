@@ -60,10 +60,7 @@ impl SessionManager {
     pub async fn create_session(&self) -> Result<String, String> {
         let mut sessions = self.sessions.lock().await;
         if sessions.len() >= self.max_sessions {
-            return Err(format!(
-                "Maximum sessions ({}) reached",
-                self.max_sessions
-            ));
+            return Err(format!("Maximum sessions ({}) reached", self.max_sessions));
         }
         let id = uuid::Uuid::new_v4().to_string();
         sessions.insert(id.clone(), Session::new(id.clone()));
@@ -81,11 +78,7 @@ impl SessionManager {
         }
     }
 
-    pub async fn add_message(
-        &self,
-        session_id: &str,
-        message: ChatMessage,
-    ) -> Result<(), String> {
+    pub async fn add_message(&self, session_id: &str, message: ChatMessage) -> Result<(), String> {
         let mut sessions = self.sessions.lock().await;
         match sessions.get_mut(session_id) {
             Some(session) => {
@@ -178,11 +171,10 @@ mod tests {
     async fn session_not_found() {
         let mgr = SessionManager::new(10, 3600);
         assert!(mgr.get_history("nonexistent").await.is_err());
-        assert!(
-            mgr.add_message("nonexistent", ChatMessage::user("hi"))
-                .await
-                .is_err()
-        );
+        assert!(mgr
+            .add_message("nonexistent", ChatMessage::user("hi"))
+            .await
+            .is_err());
     }
 
     #[tokio::test]

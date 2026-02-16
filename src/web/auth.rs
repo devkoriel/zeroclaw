@@ -6,7 +6,11 @@ use std::collections::HashMap;
 /// - If `token_config` is empty, all requests are allowed.
 /// - Otherwise, the request must supply the token via `Authorization: Bearer <token>`
 ///   header or `?token=<token>` query parameter.
-pub fn check_auth(token_config: &str, headers: &HeaderMap, query: &HashMap<String, String>) -> bool {
+pub fn check_auth(
+    token_config: &str,
+    headers: &HeaderMap,
+    query: &HashMap<String, String>,
+) -> bool {
     if token_config.is_empty() {
         return true;
     }

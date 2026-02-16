@@ -69,14 +69,8 @@ impl Tool for ScheduleTool {
                 })
             }
             "add" => {
-                let expr = args["expression"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
-                let command = args["command"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
+                let expr = args["expression"].as_str().unwrap_or("").to_string();
+                let command = args["command"].as_str().unwrap_or("").to_string();
                 if expr.is_empty() || command.is_empty() {
                     return Ok(ToolResult {
                         success: false,
@@ -87,7 +81,12 @@ impl Tool for ScheduleTool {
                 let job = crate::cron::add_job(&self.config, &expr, &command)?;
                 Ok(ToolResult {
                     success: true,
-                    output: format!("Scheduled: {} → {} (next: {})", job.expression, job.command, job.next_run.to_rfc3339()),
+                    output: format!(
+                        "Scheduled: {} → {} (next: {})",
+                        job.expression,
+                        job.command,
+                        job.next_run.to_rfc3339()
+                    ),
                     error: None,
                 })
             }

@@ -138,9 +138,7 @@ async fn ws_upgrade(
     })
 }
 
-async fn health_check(
-    State(state): State<Arc<WebAppState>>,
-) -> Json<serde_json::Value> {
+async fn health_check(State(state): State<Arc<WebAppState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "status": "ok",
         "sessions": state.sessions.session_count().await,
