@@ -4,6 +4,59 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Send a direct Telegram notification to all allowed users.
+/// Reads bot_token and allowed_users from ~/.zeroclaw/config.toml.
+/// This is fire-and-forget — errors are silently ignored.
+fn send_telegram_notification(message: &str) {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/koriel".into());
+    let config_path = format!("{home}/.zeroclaw/config.toml");
+    let config_str = match std::fs::read_to_string(&config_path) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+
+    // Quick parse: extract bot_token and allowed_users from TOML
+    let bot_token = config_str
+        .lines()
+        .find(|l| l.trim().starts_with("bot_token"))
+        .and_then(|l| l.split('=').nth(1))
+        .map(|v| v.trim().trim_matches('"').to_string());
+    let allowed_users: Vec<String> = config_str
+        .lines()
+        .find(|l| l.trim().starts_with("allowed_users"))
+        .and_then(|l| l.split('=').nth(1))
+        .map(|v| {
+            v.trim()
+                .trim_matches(|c| c == '[' || c == ']')
+                .split(',')
+                .map(|s| s.trim().trim_matches('"').to_string())
+                .filter(|s| !s.is_empty() && s != "*")
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let Some(token) = bot_token.filter(|t| !t.is_empty()) else {
+        return;
+    };
+
+    let url = format!("https://api.telegram.org/bot{token}/sendMessage");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| reqwest::blocking::Client::new());
+
+    for user_id in &allowed_users {
+        let _ = client
+            .post(&url)
+            .json(&serde_json::json!({
+                "chat_id": user_id,
+                "text": message,
+                "parse_mode": "HTML"
+            }))
+            .send();
+    }
+}
+
 /// Self-upgrade tool — checks for and applies updates from the git repository.
 pub struct SelfUpgradeTool {
     repo_dir: PathBuf,
@@ -270,35 +323,39 @@ impl Tool for SelfUpgradeTool {
                     .ok()
             });
 
-        // Phase 4: Schedule restart via a DETACHED process that outlives this daemon.
-        // nohup + setsid ensures the restart script survives when bootout kills us.
+        // Phase 4: Notify user BEFORE restart (since daemon dies during restart
+        // and the LLM response will never make it back to Telegram).
+        send_telegram_notification(&format!(
+            "🔄 <b>Deploying update</b> ({current_sha} → {remote_sha})\n\n\
+             ✅ Build: success\n\
+             ✅ Binary copied & signed\n\
+             ⏳ Restarting in ~5 seconds...\n\n\
+             I'll send another notification when I'm back."
+        ));
+
+        // Phase 5: Schedule restart via a DETACHED process that outlives this daemon.
         let uid = Command::new("id").arg("-u").output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_else(|_| "501".into());
         let plist = format!("{home}/Library/LaunchAgents/com.zeroclaw.daemon.plist");
 
         let restart_script = format!(
-            "sleep 3; launchctl bootout gui/{uid} '{plist}' 2>/dev/null; \
-             sleep 1; launchctl bootstrap gui/{uid} '{plist}'"
+            "sleep 5; launchctl bootout gui/{uid} '{plist}' 2>/dev/null; \
+             sleep 2; launchctl bootstrap gui/{uid} '{plist}'"
         );
-        // Use nohup + bash -c in background so the restart outlives our process
         let _ = Command::new("nohup")
             .args(["bash", "-c", &restart_script])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .stdin(std::process::Stdio::null())
-            .spawn(); // spawn() returns immediately, doesn't wait
+            .spawn();
 
         Ok(ToolResult {
             success: true,
             output: format!(
                 "Upgrade & deploy complete ({current_sha} → {remote_sha}).\n\
-                 Pull: {pull_output}\n\
-                 Build: success{}\n\
-                 Binary copied & signed. Daemon restarting in ~3s.\n\
-                 You'll receive a startup notification when I'm back.",
-                if build_stderr.is_empty() { String::new() }
-                else { format!("\n{build_stderr}") }
+                 Build: success. Binary copied & signed.\n\
+                 Telegram notification sent. Restarting in ~5s.",
             ),
             error: None,
         })
