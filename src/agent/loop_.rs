@@ -157,15 +157,33 @@ pub async fn auto_compact_history(
     Ok(true)
 }
 
+// --- ZeroClaw fork ---
+/// Internal memory key prefixes that should never be surfaced to the LLM.
+/// These are bookkeeping entries (auto-saved webhook messages and assistant
+/// responses) — exposing them causes the model to confuse user requests
+/// (e.g. "remove it") with memory operations on these keys.
+const INTERNAL_KEY_PREFIXES: &[&str] = &["webhook_msg_", "assistant_resp_"];
+
+fn is_internal_key(key: &str) -> bool {
+    INTERNAL_KEY_PREFIXES.iter().any(|p| key.starts_with(p))
+}
+// --- end ZeroClaw fork ---
+
 /// Build context preamble by searching memory for relevant entries
 pub async fn build_context(mem: &dyn Memory, user_msg: &str) -> String {
     let mut context = String::new();
 
     // Pull relevant memories for this message
-    if let Ok(entries) = mem.recall(user_msg, 5).await {
-        if !entries.is_empty() {
+    // --- ZeroClaw fork: request extra entries to compensate for internal key filtering ---
+    if let Ok(entries) = mem.recall(user_msg, 10).await {
+        let visible: Vec<_> = entries
+            .iter()
+            .filter(|e| !is_internal_key(&e.key))
+            .take(5)
+            .collect();
+        if !visible.is_empty() {
             context.push_str("[Memory context]\n");
-            for entry in &entries {
+            for entry in &visible {
                 let _ = writeln!(context, "- {}: {}", entry.key, entry.content);
             }
             context.push('\n');

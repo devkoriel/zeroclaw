@@ -21,8 +21,10 @@ impl Tool for MemoryForgetTool {
         "memory_forget"
     }
 
+    // --- ZeroClaw fork: clarified description to prevent LLM confusing file/folder
+    // deletion requests with memory operations ---
     fn description(&self) -> &str {
-        "Remove a memory by key. Use to delete outdated facts or sensitive data. Returns whether the memory was found and removed."
+        "Erase a stored memory entry by its exact key. ONLY use this for memory management — NOT for deleting files, folders, or other resources. Use the shell tool for file system operations."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -43,6 +45,18 @@ impl Tool for MemoryForgetTool {
             .get("key")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'key' parameter"))?;
+
+        // --- ZeroClaw fork: guard against deleting internal bookkeeping entries ---
+        if key.starts_with("webhook_msg_") || key.starts_with("assistant_resp_") {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Cannot forget internal entry '{key}'. Use the shell tool for file/folder operations."
+                )),
+            });
+        }
+        // --- end ZeroClaw fork ---
 
         match self.memory.forget(key).await {
             Ok(true) => Ok(ToolResult {
