@@ -7,6 +7,14 @@ pub struct ToolResult {
     pub success: bool,
     pub output: String,
     pub error: Option<String>,
+    /// Optional base64-encoded image (e.g. screenshot) to include in tool result.
+    /// When present, the agent loop builds a multimodal ChatMessage so the LLM
+    /// can see the actual image alongside the text output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_base64: Option<String>,
+    /// MIME type of the image (e.g. "image/jpeg", "image/png").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_mime: Option<String>,
 }
 
 /// Description of a tool for the LLM

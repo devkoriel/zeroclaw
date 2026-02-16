@@ -80,6 +80,8 @@ impl Tool for ShellTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -90,6 +92,8 @@ impl Tool for ShellTool {
                     success: false,
                     output: String::new(),
                     error: Some(reason),
+                    image_base64: None,
+                    image_mime: None,
                 });
             }
         }
@@ -99,6 +103,8 @@ impl Tool for ShellTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -115,6 +121,8 @@ impl Tool for ShellTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to build runtime command: {e}")),
+                    image_base64: None,
+                    image_mime: None,
                 });
             }
         };
@@ -196,12 +204,16 @@ impl Tool for ShellTool {
                     } else {
                         Some(stderr)
                     },
+                    image_base64: None,
+                    image_mime: None,
                 })
             }
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to execute command: {e}")),
+                image_base64: None,
+                image_mime: None,
             }),
             Err(_) => Ok(ToolResult {
                 success: false,
@@ -209,6 +221,8 @@ impl Tool for ShellTool {
                 error: Some(format!(
                     "Command timed out after {SHELL_TIMEOUT_SECS}s and was killed"
                 )),
+                image_base64: None,
+                image_mime: None,
             }),
         }
     }

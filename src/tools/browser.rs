@@ -354,12 +354,16 @@ impl BrowserTool {
                 success: true,
                 output,
                 error: None,
+                image_base64: None,
+                image_mime: None,
             })
         } else {
             Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: resp.error,
+                image_base64: None,
+                image_mime: None,
             })
         }
     }
@@ -469,6 +473,8 @@ impl Tool for BrowserTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: autonomy is read-only".into()),
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -477,6 +483,8 @@ impl Tool for BrowserTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: rate limit exceeded".into()),
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -489,6 +497,8 @@ impl Tool for BrowserTool {
                     "agent-browser CLI not found. Install with: npm install -g agent-browser"
                         .into(),
                 ),
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -650,6 +660,8 @@ impl Tool for BrowserTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Unknown action: {action_str}")),
+                    image_base64: None,
+                    image_mime: None,
                 });
             }
         };

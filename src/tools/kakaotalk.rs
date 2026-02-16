@@ -75,6 +75,8 @@ impl Tool for KakaoTalkTool {
                 success: false,
                 output: String::new(),
                 error: Some("KakaoTalk tool is not available in read-only mode".into()),
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -93,6 +95,8 @@ impl Tool for KakaoTalkTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Unknown action: {action}. Use: send_message, read_messages, list_chats, open_chat, search_chat")),
+                image_base64: None,
+                image_mime: None,
             }),
         }
     }
@@ -109,6 +113,8 @@ impl KakaoTalkTool {
                     success: false,
                     output: String::new(),
                     error: Some("Missing required parameter: chat_name".into()),
+                    image_base64: None,
+                    image_mime: None,
                 });
             }
         };
@@ -120,6 +126,8 @@ impl KakaoTalkTool {
                     success: false,
                     output: String::new(),
                     error: Some("Missing required parameter: message".into()),
+                    image_base64: None,
+                    image_mime: None,
                 });
             }
         };
@@ -130,6 +138,8 @@ impl KakaoTalkTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to activate KakaoTalk: {e}")),
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -153,6 +163,8 @@ impl KakaoTalkTool {
                             "Chat window '{}' not found. Open the chat first or check the name.",
                             chat_name
                         )),
+                        image_base64: None,
+                        image_mime: None,
                     });
                 }
                 Err(e) => {
@@ -160,6 +172,8 @@ impl KakaoTalkTool {
                         success: false,
                         output: String::new(),
                         error: Some(format!("Failed to search for chat: {e}")),
+                        image_base64: None,
+                        image_mime: None,
                     });
                 }
             }
@@ -180,6 +194,8 @@ impl KakaoTalkTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to copy message to clipboard: {e}")),
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -215,6 +231,8 @@ impl KakaoTalkTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to paste message: {e}")),
+                    image_base64: None,
+                    image_mime: None,
                 });
             }
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -227,6 +245,8 @@ impl KakaoTalkTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to press Enter: {e}")),
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -234,6 +254,8 @@ impl KakaoTalkTool {
             success: true,
             output: format!("Message sent to '{}': {}", chat_name, truncate_for_display(message, 100)),
             error: None,
+            image_base64: None,
+            image_mime: None,
         })
     }
 
@@ -246,6 +268,8 @@ impl KakaoTalkTool {
                     success: false,
                     output: String::new(),
                     error: Some("Missing required parameter: chat_name".into()),
+                    image_base64: None,
+                    image_mime: None,
                 });
             }
         };
@@ -261,6 +285,8 @@ impl KakaoTalkTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to activate KakaoTalk: {e}")),
+                image_base64: None,
+                image_mime: None,
             });
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -284,6 +310,8 @@ impl KakaoTalkTool {
                 success: true,
                 output: content,
                 error: None,
+                image_base64: None,
+                image_mime: None,
             }),
             _ => {
                 // Fallback: try getting all static text elements
@@ -300,11 +328,15 @@ impl KakaoTalkTool {
                             content
                         },
                         error: None,
+                        image_base64: None,
+                        image_mime: None,
                     }),
                     Err(e) => Ok(ToolResult {
                         success: false,
                         output: String::new(),
                         error: Some(format!("Failed to read messages: {e}. Try using the computer tool with screenshot instead.")),
+                        image_base64: None,
+                        image_mime: None,
                     }),
                 }
             }
@@ -326,12 +358,16 @@ impl KakaoTalkTool {
                         success: true,
                         output: "No KakaoTalk windows open. Use search_chat to find and open a chat.".into(),
                         error: None,
+                        image_base64: None,
+                        image_mime: None,
                     })
                 } else {
                     Ok(ToolResult {
                         success: true,
                         output: format!("Open KakaoTalk windows: {window_list}"),
                         error: None,
+                        image_base64: None,
+                        image_mime: None,
                     })
                 }
             }
@@ -339,6 +375,8 @@ impl KakaoTalkTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to list chats: {e}")),
+                image_base64: None,
+                image_mime: None,
             }),
         }
     }
@@ -352,6 +390,8 @@ impl KakaoTalkTool {
                     success: false,
                     output: String::new(),
                     error: Some("Missing required parameter: chat_name".into()),
+                    image_base64: None,
+                    image_mime: None,
                 });
             }
         };
@@ -362,6 +402,8 @@ impl KakaoTalkTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to activate KakaoTalk: {e}")),
+                image_base64: None,
+                image_mime: None,
             });
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -373,17 +415,23 @@ impl KakaoTalkTool {
                     success: true,
                     output: format!("Opened chat: {chat_name}"),
                     error: None,
+                    image_base64: None,
+                    image_mime: None,
                 })
             }
             Ok(false) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Could not find chat: {chat_name}")),
+                image_base64: None,
+                image_mime: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Error opening chat: {e}")),
+                image_base64: None,
+                image_mime: None,
             }),
         }
     }
@@ -397,6 +445,8 @@ impl KakaoTalkTool {
                     success: false,
                     output: String::new(),
                     error: Some("Missing required parameter: query".into()),
+                    image_base64: None,
+                    image_mime: None,
                 });
             }
         };
@@ -407,6 +457,8 @@ impl KakaoTalkTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to activate KakaoTalk: {e}")),
+                image_base64: None,
+                image_mime: None,
             });
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -417,6 +469,8 @@ impl KakaoTalkTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to copy search query: {e}")),
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -427,6 +481,8 @@ impl KakaoTalkTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to open search: {e}")),
+                image_base64: None,
+                image_mime: None,
             });
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -438,6 +494,8 @@ impl KakaoTalkTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to paste search query: {e}")),
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -445,6 +503,8 @@ impl KakaoTalkTool {
             success: true,
             output: format!("Searched for '{}' in KakaoTalk. Use list_chats to see results or open_chat to open a specific chat.", query),
             error: None,
+            image_base64: None,
+            image_mime: None,
         })
     }
 

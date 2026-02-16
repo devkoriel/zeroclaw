@@ -69,11 +69,15 @@ impl Tool for MemoryStoreTool {
                 success: true,
                 output: format!("Stored memory: {key}"),
                 error: None,
+                image_base64: None,
+                image_mime: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to store memory: {e}")),
+                image_base64: None,
+                image_mime: None,
             }),
         }
     }

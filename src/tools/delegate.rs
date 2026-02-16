@@ -106,6 +106,8 @@ impl Tool for DelegateTool {
                 success: false,
                 output: String::new(),
                 error: Some("'agent' parameter must not be empty".into()),
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -120,6 +122,8 @@ impl Tool for DelegateTool {
                 success: false,
                 output: String::new(),
                 error: Some("'prompt' parameter must not be empty".into()),
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -146,6 +150,8 @@ impl Tool for DelegateTool {
                             available.join(", ")
                         }
                     )),
+                    image_base64: None,
+                    image_mime: None,
                 });
             }
         };
@@ -161,6 +167,8 @@ impl Tool for DelegateTool {
                     depth = self.depth,
                     max = agent_config.max_depth
                 )),
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -181,6 +189,8 @@ impl Tool for DelegateTool {
                             "Failed to create provider '{}' for agent '{agent_name}': {e}",
                             agent_config.provider
                         )),
+                        image_base64: None,
+                        image_mime: None,
                     });
                 }
             };
@@ -215,6 +225,8 @@ impl Tool for DelegateTool {
                     error: Some(format!(
                         "Agent '{agent_name}' timed out after {DELEGATE_TIMEOUT_SECS}s"
                     )),
+                    image_base64: None,
+                    image_mime: None,
                 });
             }
         };
@@ -228,11 +240,15 @@ impl Tool for DelegateTool {
                     model = agent_config.model
                 ),
                 error: None,
+                image_base64: None,
+                image_mime: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Agent '{agent_name}' failed: {e}",)),
+                image_base64: None,
+                image_mime: None,
             }),
         }
     }

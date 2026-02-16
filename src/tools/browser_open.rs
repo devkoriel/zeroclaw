@@ -87,6 +87,8 @@ impl Tool for BrowserOpenTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: autonomy is read-only".into()),
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -95,6 +97,8 @@ impl Tool for BrowserOpenTool {
                 success: false,
                 output: String::new(),
                 error: Some("Action blocked: rate limit exceeded".into()),
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -105,6 +109,8 @@ impl Tool for BrowserOpenTool {
                     success: false,
                     output: String::new(),
                     error: Some(e.to_string()),
+                    image_base64: None,
+                    image_mime: None,
                 })
             }
         };
@@ -114,11 +120,15 @@ impl Tool for BrowserOpenTool {
                 success: true,
                 output: format!("Opened in Brave: {url}"),
                 error: None,
+                image_base64: None,
+                image_mime: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to open Brave Browser: {e}")),
+                image_base64: None,
+                image_mime: None,
             }),
         }
     }

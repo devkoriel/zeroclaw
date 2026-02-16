@@ -2,22 +2,25 @@ use super::traits::{Tool, ToolResult};
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use base64::Engine;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 
 /// Timeout for shell sub-commands (screencapture, sips, cliclick, etc.).
-const CMD_TIMEOUT: Duration = Duration::from_secs(15);
+const CMD_TIMEOUT: Duration = Duration::from_secs(20);
 /// Timeout for the Gemini Vision API call.
-const VISION_TIMEOUT: Duration = Duration::from_secs(30);
+const VISION_TIMEOUT: Duration = Duration::from_secs(45);
 /// Vision model to use for screenshot descriptions.
-const VISION_MODEL: &str = "gemini-2.0-flash";
-/// Maximum JPEG file size to send to vision API (~4 MB).
-const MAX_JPEG_BYTES: u64 = 4_194_304;
+const VISION_MODEL: &str = "gemini-2.5-flash";
+/// Maximum image file size to send to vision API (~6 MB).
+const MAX_IMAGE_BYTES: u64 = 6_291_456;
 /// Delay after opening an app to let it fully render.
 const OPEN_APP_DELAY: Duration = Duration::from_millis(1500);
+/// Screenshot cache TTL — avoid redundant captures in rapid screenshot→click→verify cycles.
+const SCREENSHOT_CACHE_TTL: Duration = Duration::from_secs(3);
 
 /// Keys that cliclick's `kp:` command supports.
 /// Regular character keys (a-z, 0-9, punctuation) are NOT supported by cliclick
@@ -81,15 +84,142 @@ struct VisionGenConfig {
     temperature: f64,
     #[serde(rename = "maxOutputTokens")]
     max_output_tokens: u32,
+    #[serde(rename = "responseMimeType", skip_serializing_if = "Option::is_none")]
+    response_mime_type: Option<String>,
+    #[serde(rename = "responseSchema", skip_serializing_if = "Option::is_none")]
+    response_schema: Option<serde_json::Value>,
+}
+
+// ── Structured Vision Response types ─────────────────────────────────────────
+
+/// Parsed structured response from Gemini Vision API.
+#[derive(Debug, Deserialize)]
+struct VisionResponse {
+    foreground_app: Option<String>,
+    screen_state: Option<String>,
+    elements: Option<Vec<VisionElement>>,
+    visible_text: Option<String>,
+}
+
+/// A single interactive UI element detected in a screenshot.
+#[derive(Debug, Deserialize)]
+struct VisionElement {
+    label: String,
+    #[serde(rename = "type")]
+    element_type: String,
+    x: i32,
+    y: i32,
+    width: Option<i32>,
+    height: Option<i32>,
+    state: Option<String>,
+}
+
+/// Build the JSON schema for Gemini's structured output.
+fn vision_response_schema() -> serde_json::Value {
+    json!({
+        "type": "OBJECT",
+        "properties": {
+            "foreground_app": {
+                "type": "STRING",
+                "description": "Name of the frontmost application"
+            },
+            "screen_state": {
+                "type": "STRING",
+                "description": "Brief description: dialogs, notifications, loading, idle, etc."
+            },
+            "elements": {
+                "type": "ARRAY",
+                "description": "All interactive UI elements with precise pixel coordinates",
+                "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "label": {"type": "STRING", "description": "Element text or accessible label"},
+                        "type": {"type": "STRING", "description": "button, text_field, link, menu_item, tab, icon, checkbox, chat_item, list_item, image, toggle, dropdown"},
+                        "x": {"type": "INTEGER", "description": "Center X in pixels from top-left"},
+                        "y": {"type": "INTEGER", "description": "Center Y in pixels from top-left"},
+                        "width": {"type": "INTEGER", "description": "Approximate width in pixels"},
+                        "height": {"type": "INTEGER", "description": "Approximate height in pixels"},
+                        "state": {"type": "STRING", "description": "enabled, disabled, selected, focused, checked, unchecked"}
+                    },
+                    "required": ["label", "type", "x", "y"]
+                }
+            },
+            "visible_text": {
+                "type": "STRING",
+                "description": "All visible text content on screen (messages, labels, titles, paragraphs)"
+            }
+        },
+        "required": ["foreground_app", "screen_state", "elements"]
+    })
+}
+
+/// Format a parsed VisionResponse into a structured text description for the agent LLM.
+fn format_vision_response(resp: &VisionResponse) -> String {
+    let mut out = String::with_capacity(2048);
+
+    out.push_str("[Screen Analysis]\n");
+    if let Some(ref app) = resp.foreground_app {
+        out.push_str(&format!("App: {app}\n"));
+    }
+    if let Some(ref state) = resp.screen_state {
+        out.push_str(&format!("State: {state}\n"));
+    }
+    out.push('\n');
+
+    if let Some(ref elements) = resp.elements {
+        if !elements.is_empty() {
+            out.push_str("[Interactive Elements] (use these coordinates for click actions)\n");
+            for (i, el) in elements.iter().enumerate() {
+                let size = match (el.width, el.height) {
+                    (Some(w), Some(h)) => format!(" [{w}x{h}]"),
+                    _ => String::new(),
+                };
+                let state_str = el
+                    .state
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| format!(" ({s})"))
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "{}. \"{}\" ({}) at ({}, {}){}{}\n",
+                    i + 1,
+                    el.label,
+                    el.element_type,
+                    el.x,
+                    el.y,
+                    size,
+                    state_str
+                ));
+            }
+            out.push('\n');
+        }
+    }
+
+    if let Some(ref text) = resp.visible_text {
+        if !text.is_empty() {
+            out.push_str("[Visible Text]\n");
+            out.push_str(text);
+            out.push('\n');
+        }
+    }
+
+    out
 }
 
 // ── Tool implementation ─────────────────────────────────────────────────────
+
+/// Cached screenshot data (base64 + timestamp).
+struct ScreenshotCache {
+    base64: String,
+    captured_at: Instant,
+}
 
 /// Computer-use tool — see the screen via vision AI and control mouse/keyboard.
 pub struct ComputerTool {
     security: Arc<SecurityPolicy>,
     gemini_key: Option<String>,
     client: reqwest::Client,
+    screenshot_cache: Arc<Mutex<Option<ScreenshotCache>>>,
 }
 
 impl ComputerTool {
@@ -103,6 +233,7 @@ impl ComputerTool {
             security,
             gemini_key,
             client,
+            screenshot_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -114,11 +245,14 @@ impl ComputerTool {
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        // 1. Capture screenshot
-        let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S%3f");
-        let path = format!("/tmp/zeroclaw_screen_{ts}.jpg");
+        // 0. Wake display if sleeping (user-activity assertion for 5s)
+        let _ = run_cmd("caffeinate", &["-u", "-t", "5"]).await;
 
-        if let Err(e) = run_cmd("screencapture", &["-x", "-t", "jpg", &path]).await {
+        // 1. Capture screenshot (PNG for lossless quality + better text OCR)
+        let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S%3f");
+        let path = format!("/tmp/zeroclaw_screen_{ts}.png");
+
+        if let Err(e) = run_cmd("screencapture", &["-x", "-t", "png", &path]).await {
             return err_result(format!(
                 "Screenshot capture failed: {e}\n\n\
                  If Screen Recording permission is needed:\n\
@@ -128,18 +262,33 @@ impl ComputerTool {
             ));
         }
 
-        // Check if screenshot file is empty (permission denied produces 0-byte file)
+        // Check if screenshot file is empty (permission denied or locked screen)
         if let Ok(meta) = tokio::fs::metadata(&path).await {
             if meta.len() == 0 {
+                // Retry once: wake display, wait, re-capture
                 let _ = tokio::fs::remove_file(&path).await;
-                return err_result(
-                    "Screen Recording permission required — screenshot file is empty.\n\n\
-                     Grant it now:\n\
-                     1. Open: System Settings → Privacy & Security → Screen Recording\n\
-                     2. Click + and add /Applications/ZeroClaw.app\n\
-                     3. Toggle it ON\n\
-                     4. Restart the daemon: launchctl kickstart -k gui/501/com.zeroclaw.daemon"
-                );
+                tracing::info!("Screenshot empty — waking display and retrying");
+                let _ = run_cmd("caffeinate", &["-u", "-t", "5"]).await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+
+                if let Err(e) = run_cmd("screencapture", &["-x", "-t", "png", &path]).await {
+                    return err_result(format!("Screenshot retry failed: {e}"));
+                }
+
+                // Check again
+                if let Ok(meta2) = tokio::fs::metadata(&path).await {
+                    if meta2.len() == 0 {
+                        let _ = tokio::fs::remove_file(&path).await;
+                        return err_result(
+                            "Screen Recording permission required — screenshot file is empty.\n\n\
+                             Grant it now:\n\
+                             1. Open: System Settings → Privacy & Security → Screen Recording\n\
+                             2. Click + and add /Applications/ZeroClaw.app\n\
+                             3. Toggle it ON\n\
+                             4. Restart the daemon: launchctl kickstart -k gui/501/com.zeroclaw.daemon"
+                        );
+                    }
+                }
             }
         }
 
@@ -157,10 +306,10 @@ impl ComputerTool {
                 return err_result(format!("Cannot read screenshot: {e}"));
             }
         };
-        if meta.len() > MAX_JPEG_BYTES {
+        if meta.len() > MAX_IMAGE_BYTES {
             let _ = tokio::fs::remove_file(&path).await;
             return err_result(format!(
-                "Screenshot too large ({} bytes). Max: {MAX_JPEG_BYTES}",
+                "Screenshot too large ({} bytes). Max: {MAX_IMAGE_BYTES}",
                 meta.len()
             ));
         }
@@ -175,10 +324,38 @@ impl ComputerTool {
         let _ = tokio::fs::remove_file(&path).await;
         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
+        // Update screenshot cache
+        {
+            let mut cache = self.screenshot_cache.lock().await;
+            *cache = Some(ScreenshotCache {
+                base64: b64.clone(),
+                captured_at: Instant::now(),
+            });
+        }
+
+        // --- ZeroClaw fork: Hybrid Programmatic Grounding ---
+        // Try structured screen probing first (Swift AXAPI → JXA → Vision fallback).
+        // If probe succeeds with elements, return structured data + screenshot image.
+        // If probe fails, fall through to existing Vision API path (unchanged).
+        if let Ok(state) = crate::tools::screen_state::probe_screen_state().await {
+            let mut output = crate::tools::screen_state::format_screen_state(&state);
+            if !extra_prompt.is_empty() {
+                output.push_str(&format!("[User context: {extra_prompt}]\n"));
+            }
+            return ToolResult {
+                success: true,
+                output,
+                error: None,
+                image_base64: Some(b64),
+                image_mime: Some("image/png".into()),
+            };
+        }
+        // --- end ZeroClaw fork ---
+
         // 4. Image width for the vision prompt dimension hint
         let img_w = logical_width.unwrap_or(0);
 
-        // 5. Call Gemini Vision API
+        // 5. Call Gemini Vision API (Tier 3 fallback — probes returned 0 elements)
         let api_key = match &self.gemini_key {
             Some(k) if !k.is_empty() => k.as_str(),
             _ => {
@@ -191,6 +368,8 @@ impl ComputerTool {
                         bytes.len()
                     ),
                     error: None,
+                    image_base64: Some(b64),
+                    image_mime: Some("image/png".into()),
                 };
             }
         };
@@ -202,30 +381,51 @@ impl ComputerTool {
         };
 
         let prompt = format!(
-            "Describe this macOS screenshot in detail. {dim_hint}\n\
-             For each interactive UI element (buttons, text fields, links, menu items, \
-             tabs, icons, checkboxes), provide its approximate center coordinates as \
-             [x, y] in pixels from the top-left corner of the image.\n\
-             Format: Element 'Label' at [x, y]\n\n\
-             Describe:\n\
-             1. Which application is in the foreground\n\
-             2. All visible text content (messages, labels, titles)\n\
-             3. All interactive elements with coordinates\n\
-             4. Current state (any dialogs, notifications, selections)\n\
-             {extra_prompt}\n\
-             Be concise but thorough. Focus on actionable elements."
+            "Analyze this macOS screenshot. {dim_hint}\n\
+             Coordinates must be PRECISE pixel positions from the top-left corner — they will be used directly for mouse clicks.\n\
+             For every interactive UI element, report its CENTER x,y coordinates.\n\
+             Include: buttons, text fields, links, menu items, tabs, icons, checkboxes, chat items, list items, toggles, dropdowns.\n\
+             {extra_prompt}"
         );
 
         match self.call_vision_api(api_key, &b64, &prompt).await {
-            Ok(description) => ToolResult {
-                success: true,
-                output: description,
-                error: None,
-            },
+            Ok(description) => {
+                // Try to parse structured JSON from Gemini
+                let formatted = match serde_json::from_str::<VisionResponse>(&description) {
+                    Ok(parsed) => {
+                        // Validate coordinates are within screen bounds
+                        if let (Some(w), Some(ref elements)) = (logical_width, &parsed.elements) {
+                            for el in elements {
+                                if el.x < 0 || el.y < 0 || el.x > w as i32 * 2 {
+                                    tracing::warn!(
+                                        "Vision element '{}' has suspicious coordinates ({}, {}) for {}px screen",
+                                        el.label, el.x, el.y, w
+                                    );
+                                }
+                            }
+                        }
+                        format_vision_response(&parsed)
+                    }
+                    Err(_) => {
+                        // Fallback: return raw text (backward compatible)
+                        tracing::debug!("Vision API returned non-JSON; using raw text");
+                        description
+                    }
+                };
+                ToolResult {
+                    success: true,
+                    output: formatted,
+                    error: None,
+                    image_base64: Some(b64),
+                    image_mime: Some("image/png".into()),
+                }
+            }
             Err(e) => ToolResult {
                 success: false,
                 output: format!("Screenshot captured ({} bytes) but vision API failed.", bytes.len()),
                 error: Some(format!("Vision API error: {e}")),
+                image_base64: Some(b64),
+                image_mime: Some("image/png".into()),
             },
         }
     }
@@ -233,7 +433,7 @@ impl ComputerTool {
     async fn call_vision_api(
         &self,
         api_key: &str,
-        jpeg_b64: &str,
+        image_b64: &str,
         prompt: &str,
     ) -> Result<String, String> {
         let url = format!(
@@ -249,8 +449,8 @@ impl ComputerTool {
                     },
                     VisionPart::InlineData {
                         inline_data: InlineData {
-                            mime_type: "image/jpeg".into(),
-                            data: jpeg_b64.to_string(),
+                            mime_type: "image/png".into(),
+                            data: image_b64.to_string(),
                         },
                     },
                 ],
@@ -258,6 +458,8 @@ impl ComputerTool {
             generation_config: VisionGenConfig {
                 temperature: 0.1,
                 max_output_tokens: 4096,
+                response_mime_type: Some("application/json".into()),
+                response_schema: Some(vision_response_schema()),
             },
         };
 
@@ -312,6 +514,8 @@ impl ComputerTool {
                 success: true,
                 output: format!("Clicked at ({x}, {y}). {out}"),
                 error: None,
+                image_base64: None,
+                image_mime: None,
             },
             Err(e) => err_result(format!("Click failed: {e}")),
         }
@@ -334,6 +538,8 @@ impl ComputerTool {
                 success: true,
                 output: format!("Typed: \"{text}\""),
                 error: None,
+                image_base64: None,
+                image_mime: None,
             },
             Err(e) => err_result(format!("Type failed: {e}")),
         }
@@ -373,6 +579,8 @@ impl ComputerTool {
                 success: true,
                 output: format!("Key combo: {combo}"),
                 error: None,
+                image_base64: None,
+                image_mime: None,
             },
             Err(e) => {
                 // Fallback to AppleScript if cliclick fails
@@ -441,6 +649,8 @@ impl ComputerTool {
                 success: true,
                 output: format!("Key combo: {combo} (via AppleScript)"),
                 error: None,
+                image_base64: None,
+                image_mime: None,
             },
             Err(e) => err_result(format!("Key press failed (AppleScript): {e}")),
         }
@@ -504,6 +714,8 @@ impl ComputerTool {
                 success: true,
                 output: format!("Scrolled {direction} by {amount}"),
                 error: None,
+                image_base64: None,
+                image_mime: None,
             },
             Err(e) => {
                 // Fallback: AppleScript key codes (arrow keys — not true scrolling but
@@ -527,6 +739,8 @@ impl ComputerTool {
                         success: true,
                         output: format!("Scrolled {direction} by {amount} (fallback)"),
                         error: None,
+                        image_base64: None,
+                        image_mime: None,
                     },
                     Err(e2) => err_result(format!(
                         "Scroll failed. Primary (JXA CoreGraphics): {e}. Fallback (osascript): {e2}"
@@ -560,6 +774,8 @@ impl ComputerTool {
                     success: true,
                     output: format!("Opened application: {app_name}"),
                     error: None,
+                    image_base64: None,
+                    image_mime: None,
                 }
             }
             Err(e) => err_result(format!("Failed to open {app_name}: {e}")),
@@ -578,6 +794,8 @@ impl ComputerTool {
                 success: true,
                 output: format!("Cursor position: {out}"),
                 error: None,
+                image_base64: None,
+                image_mime: None,
             },
             Err(e) => err_result(format!("Failed to get cursor position: {e}")),
         }
@@ -678,6 +896,8 @@ fn err_result(msg: impl Into<String>) -> ToolResult {
         success: false,
         output: String::new(),
         error: Some(msg),
+        image_base64: None,
+        image_mime: None,
     }
 }
 
@@ -1142,6 +1362,8 @@ mod tests {
             generation_config: VisionGenConfig {
                 temperature: 0.1,
                 max_output_tokens: 4096,
+                response_mime_type: None,
+                response_schema: None,
             },
         };
 
@@ -1152,6 +1374,87 @@ mod tests {
         assert!(json_str.contains("\"data\":\"abc123\""));
         assert!(json_str.contains("\"temperature\":0.1"));
         assert!(json_str.contains("\"maxOutputTokens\":4096"));
+    }
+
+    // ── Structured Vision Response tests ───────────────────────────────
+
+    #[test]
+    fn parse_vision_response_full() {
+        let json = r#"{
+            "foreground_app": "KakaoTalk",
+            "screen_state": "Chat list visible",
+            "elements": [
+                {"label": "가족", "type": "chat_item", "x": 150, "y": 300, "width": 120, "height": 40, "state": "enabled"},
+                {"label": "Search", "type": "text_field", "x": 200, "y": 60, "width": 300, "height": 30}
+            ],
+            "visible_text": "가족 - 좋은 아침!"
+        }"#;
+
+        let resp: VisionResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.foreground_app.as_deref(), Some("KakaoTalk"));
+        assert_eq!(resp.elements.as_ref().unwrap().len(), 2);
+        assert_eq!(resp.elements.as_ref().unwrap()[0].x, 150);
+        assert_eq!(resp.elements.as_ref().unwrap()[0].y, 300);
+    }
+
+    #[test]
+    fn parse_vision_response_minimal() {
+        let json = r#"{
+            "foreground_app": "Finder",
+            "screen_state": "idle",
+            "elements": []
+        }"#;
+
+        let resp: VisionResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.foreground_app.as_deref(), Some("Finder"));
+        assert!(resp.elements.as_ref().unwrap().is_empty());
+        assert!(resp.visible_text.is_none());
+    }
+
+    #[test]
+    fn format_vision_response_produces_structured_text() {
+        let resp = VisionResponse {
+            foreground_app: Some("Safari".into()),
+            screen_state: Some("Web page loaded".into()),
+            elements: Some(vec![
+                VisionElement {
+                    label: "Submit".into(),
+                    element_type: "button".into(),
+                    x: 400,
+                    y: 500,
+                    width: Some(80),
+                    height: Some(30),
+                    state: Some("enabled".into()),
+                },
+                VisionElement {
+                    label: "Email".into(),
+                    element_type: "text_field".into(),
+                    x: 300,
+                    y: 200,
+                    width: None,
+                    height: None,
+                    state: None,
+                },
+            ]),
+            visible_text: Some("Welcome to the site".into()),
+        };
+
+        let text = format_vision_response(&resp);
+        assert!(text.contains("App: Safari"));
+        assert!(text.contains("State: Web page loaded"));
+        assert!(text.contains("\"Submit\" (button) at (400, 500) [80x30] (enabled)"));
+        assert!(text.contains("\"Email\" (text_field) at (300, 200)"));
+        assert!(text.contains("[Visible Text]"));
+        assert!(text.contains("Welcome to the site"));
+    }
+
+    #[test]
+    fn vision_response_schema_has_required_fields() {
+        let schema = vision_response_schema();
+        let required = schema["required"].as_array().unwrap();
+        assert!(required.iter().any(|v| v == "foreground_app"));
+        assert!(required.iter().any(|v| v == "screen_state"));
+        assert!(required.iter().any(|v| v == "elements"));
     }
 
     // ── Caching tests ───────────────────────────────────────────────────

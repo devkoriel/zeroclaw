@@ -210,12 +210,16 @@ impl Tool for ComposioTool {
                             success: true,
                             output,
                             error: None,
+                            image_base64: None,
+                            image_mime: None,
                         })
                     }
                     Err(e) => Ok(ToolResult {
                         success: false,
                         output: String::new(),
                         error: Some(format!("Failed to list actions: {e}")),
+                        image_base64: None,
+                        image_mime: None,
                     }),
                 }
             }
@@ -239,12 +243,16 @@ impl Tool for ComposioTool {
                             success: true,
                             output,
                             error: None,
+                            image_base64: None,
+                            image_mime: None,
                         })
                     }
                     Err(e) => Ok(ToolResult {
                         success: false,
                         output: String::new(),
                         error: Some(format!("Action execution failed: {e}")),
+                        image_base64: None,
+                        image_mime: None,
                     }),
                 }
             }
@@ -260,11 +268,15 @@ impl Tool for ComposioTool {
                         success: true,
                         output: format!("Open this URL to connect {app}:\n{url}"),
                         error: None,
+                        image_base64: None,
+                        image_mime: None,
                     }),
                     Err(e) => Ok(ToolResult {
                         success: false,
                         output: String::new(),
                         error: Some(format!("Failed to get connection URL: {e}")),
+                        image_base64: None,
+                        image_mime: None,
                     }),
                 }
             }
@@ -275,6 +287,8 @@ impl Tool for ComposioTool {
                 error: Some(format!(
                     "Unknown action '{action}'. Use 'list', 'execute', or 'connect'."
                 )),
+                image_base64: None,
+                image_mime: None,
             }),
         }
     }

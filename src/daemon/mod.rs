@@ -84,9 +84,17 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
         ));
     }
 
+    // Spawn caffeinate to prevent display/idle/disk/system sleep while daemon runs.
+    // This ensures ZeroClaw can take screenshots and operate even when the Mac would
+    // normally go to sleep (e.g. lid closed with external power).
+    let caffeinate_child = spawn_caffeinate();
+
     println!("🧠 ZeroClaw daemon started");
     println!("   Gateway:  http://{host}:{port}");
     println!("   Components: gateway, channels, heartbeat, scheduler");
+    if caffeinate_child.is_some() {
+        println!("   Sleep prevention: active (caffeinate)");
+    }
     println!("   Ctrl+C to stop");
 
     // Send startup notification to configured Telegram channels
@@ -94,6 +102,13 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
 
     tokio::signal::ctrl_c().await?;
     crate::health::mark_component_error("daemon", "shutdown requested");
+
+    // Kill caffeinate child before shutting down
+    if let Some(mut child) = caffeinate_child {
+        let _ = child.kill();
+        let _ = child.wait();
+        tracing::info!("caffeinate process terminated");
+    }
 
     for handle in &handles {
         handle.abort();
@@ -290,6 +305,31 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
             } else {
                 crate::health::mark_component_ok("heartbeat");
             }
+        }
+    }
+}
+
+/// Spawn `caffeinate -dims` to prevent display/idle/disk/system sleep.
+/// Returns the child process handle so the caller can kill it on shutdown.
+/// Returns None if caffeinate is not available (non-macOS).
+fn spawn_caffeinate() -> Option<std::process::Child> {
+    // -d: prevent display sleep
+    // -i: prevent idle sleep
+    // -m: prevent disk sleep
+    // -s: prevent system sleep (on AC power)
+    match std::process::Command::new("caffeinate")
+        .args(["-dims"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => {
+            tracing::info!("caffeinate started (pid: {})", child.id());
+            Some(child)
+        }
+        Err(e) => {
+            tracing::warn!("Failed to start caffeinate (sleep prevention disabled): {e}");
+            None
         }
     }
 }

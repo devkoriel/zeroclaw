@@ -61,6 +61,8 @@ impl Tool for FileReadTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -74,6 +76,8 @@ impl Tool for FileReadTool {
                     "APPROVAL_REQUIRED: Path `{path}` is outside the allowed workspace. \
                      Ask the user for explicit approval before proceeding."
                 )),
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -94,6 +98,8 @@ impl Tool for FileReadTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to resolve file path: {e}")),
+                    image_base64: None,
+                    image_mime: None,
                 });
             }
         };
@@ -107,6 +113,8 @@ impl Tool for FileReadTool {
                     "Resolved path escapes workspace: {}",
                     resolved_path.display()
                 )),
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -121,6 +129,8 @@ impl Tool for FileReadTool {
                             "File too large: {} bytes (limit: {MAX_FILE_SIZE_BYTES} bytes)",
                             meta.len()
                         )),
+                        image_base64: None,
+                        image_mime: None,
                     });
                 }
             }
@@ -129,6 +139,8 @@ impl Tool for FileReadTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to read file metadata: {e}")),
+                    image_base64: None,
+                    image_mime: None,
                 });
             }
         }
@@ -138,6 +150,8 @@ impl Tool for FileReadTool {
                 success: false,
                 output: String::new(),
                 error: Some("Rate limit exceeded: action budget exhausted".into()),
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -146,11 +160,15 @@ impl Tool for FileReadTool {
                 success: true,
                 output: contents,
                 error: None,
+                image_base64: None,
+                image_mime: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to read file: {e}")),
+                image_base64: None,
+                image_mime: None,
             }),
         }
     }

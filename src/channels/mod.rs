@@ -518,22 +518,40 @@ pub fn build_system_prompt(
          - Never ask \"what would you like to call it?\" when the user already implied a name.\n\
          - Prefer action over conversation. Show results, not questions.\n\n\
          ### Computer Use (via `computer` tool)\n\n\
-         You can interact with ANY application on this Mac by seeing the screen and controlling mouse/keyboard:\n\n\
-         1. **See**: `computer(action=screenshot)` → returns text description with element coordinates\n\
-         2. **Think**: Find the UI element you need from the description\n\
-         3. **Act**: `click`/`type`/`key` to interact with elements\n\
+         You can do ANYTHING the user can do on this Mac. For ANY task a human can perform manually, \
+         you can do it via the computer tool. You are a human surrogate.\n\n\
+         **Approach priority:**\n\
+         1. Prefer programmatic methods when available (AppleScript, shell, APIs) — faster and more reliable\n\
+         2. Fall back to GUI (screenshot + click) only when no programmatic path exists\n\
+         3. For messaging apps: use dedicated tools when available, computer tool for all others\n\
+         4. Always verify actions worked by taking a follow-up screenshot\n\n\
+         **How it works:**\n\
+         1. **See**: `computer(action=screenshot)` → returns structured JSON with app name, element list with PRECISE coordinates, and visible text\n\
+         2. **Think**: Find the UI element you need — use the EXACT coordinates from the element list\n\
+         3. **Act**: `click`/`type`/`key` to interact with elements at those coordinates\n\
          4. **Verify**: Screenshot again to confirm the action worked\n\n\
-         Workflow example — check KakaoTalk:\n\
+         The screenshot tool returns structured data:\n\
+         - `[Interactive Elements]` — each element has a name, type, and exact (x, y) coordinates for clicking\n\
+         - Use these coordinates DIRECTLY in click actions — they are precise pixel positions\n\
+         - The tool auto-wakes sleeping displays — it works even when the Mac is locked/sleeping\n\n\
+         **Confirmation protocol for external actions:**\n\
+         - **Sending messages** (KakaoTalk, iMessage, email, Slack, etc.): type the message, then ASK the user for confirmation before pressing Enter/Send. Show the recipient and message content.\n\
+         - **Financial/purchase actions**: ALWAYS ask before clicking Buy/Pay/Confirm\n\
+         - **Deleting/modifying others' data**: ALWAYS ask first\n\
+         - **Installing/uninstalling apps**: Ask first\n\
+         - When you need input, confirmation, or help: ask via the current channel and WAIT for a response before proceeding\n\n\
+         Workflow example — send KakaoTalk message:\n\
          1. `computer(action=open_app, text=\"KakaoTalk\")`\n\
-         2. `computer(action=screenshot)` → see app state\n\
-         3. `computer(action=click, x=150, y=300)` → click on chat\n\
-         4. `computer(action=screenshot)` → read messages\n\
-         5. `computer(action=click, x=400, y=500)` → click input field\n\
-         6. `computer(action=type, text=\"reply here\")`\n\
-         7. `computer(action=key, key=\"enter\")` → send\n\n\
+         2. `computer(action=screenshot)` → structured element list with coordinates\n\
+         3. `computer(action=click, x=<family_chat_x>, y=<family_chat_y>)` → click on family chat (from element list)\n\
+         4. `computer(action=screenshot)` → verify chat opened, find input field coordinates\n\
+         5. `computer(action=click, x=<input_x>, y=<input_y>)` → click input field\n\
+         6. `computer(action=type, text=\"좋은 아침입니다.\")` → type the message\n\
+         7. **ASK USER**: \"메시지를 전송할까요? '좋은 아침입니다.' → 가족\" → wait for yes/no\n\
+         8. On \"yes\": `computer(action=key, key=\"enter\")` → send\n\n\
          Tips:\n\
          - Always screenshot first to see current state before clicking\n\
-         - Coordinates come from the screenshot description\n\
+         - Coordinates come from the structured element list — use them exactly\n\
          - Key combos: cmd+c (copy), cmd+v (paste), cmd+tab (switch app)\n\
          - Click a text field before typing into it\n\
          - Use `osascript` in shell tool for specific macOS app integration (Mail, Calendar, etc.)\n\n\
@@ -1437,6 +1455,8 @@ mod tests {
                     success: false,
                     output: String::new(),
                     error: Some("unexpected symbol".to_string()),
+                    image_base64: None,
+                    image_mime: None,
                 });
             }
 
@@ -1444,6 +1464,8 @@ mod tests {
                 success: true,
                 output: r#"{"symbol":"BTC","price_usd":65000}"#.to_string(),
                 error: None,
+                image_base64: None,
+                image_mime: None,
             })
         }
     }

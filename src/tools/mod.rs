@@ -11,6 +11,8 @@ pub mod kakaotalk;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
+// --- ZeroClaw fork: Hybrid Programmatic Grounding ---
+pub mod screen_state;
 pub mod screenshot;
 pub mod self_upgrade;
 pub mod shell;
@@ -286,6 +288,8 @@ mod tests {
             success: true,
             output: "hello".into(),
             error: None,
+            image_base64: None,
+            image_mime: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: ToolResult = serde_json::from_str(&json).unwrap();
@@ -300,6 +304,8 @@ mod tests {
             success: false,
             output: String::new(),
             error: Some("boom".into()),
+            image_base64: None,
+            image_mime: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let parsed: ToolResult = serde_json::from_str(&json).unwrap();

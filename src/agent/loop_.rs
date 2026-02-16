@@ -432,6 +432,8 @@ pub async fn agent_turn(
 
         // Execute each tool call and build results
         let mut tool_results = String::new();
+        // Capture at most one image from tool results to send to the agent LLM
+        let mut result_image: Option<(String, String)> = None; // (base64, mime)
         for call in &tool_calls {
             let start = Instant::now();
             // Self-approval guard: strip approved=true if this tool was
@@ -467,6 +469,12 @@ pub async fn agent_turn(
                                 }
                             }
                         }
+                        // Capture image from tool result (first one only to limit context)
+                        if result_image.is_none() {
+                            if let (Some(b64), Some(mime)) = (r.image_base64.as_ref(), r.image_mime.as_ref()) {
+                                result_image = Some((b64.clone(), mime.clone()));
+                            }
+                        }
                         if r.success {
                             r.output
                         } else {
@@ -498,9 +506,16 @@ pub async fn agent_turn(
             );
         }
 
-        // Add assistant message with tool calls + tool results to history
+        // Add assistant message with tool calls + tool results to history.
+        // If a tool returned an image (e.g. screenshot), send it as a multimodal
+        // message so the agent LLM can see the actual screen.
         history.push(ChatMessage::assistant(&response));
-        history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
+        let results_text = format!("[Tool results]\n{tool_results}");
+        if let Some((b64, mime)) = result_image {
+            history.push(ChatMessage::with_image(results_text, b64, mime));
+        } else {
+            history.push(ChatMessage::user(results_text));
+        }
     }
 
     // Exhausted iterations — return partial text instead of hard failure

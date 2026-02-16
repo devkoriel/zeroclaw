@@ -54,6 +54,8 @@ impl Tool for MemoryForgetTool {
                 error: Some(format!(
                     "Cannot forget internal entry '{key}'. Use the shell tool for file/folder operations."
                 )),
+                image_base64: None,
+                image_mime: None,
             });
         }
         // --- end ZeroClaw fork ---
@@ -63,16 +65,22 @@ impl Tool for MemoryForgetTool {
                 success: true,
                 output: format!("Forgot memory: {key}"),
                 error: None,
+                image_base64: None,
+                image_mime: None,
             }),
             Ok(false) => Ok(ToolResult {
                 success: true,
                 output: format!("No memory found with key: {key}"),
                 error: None,
+                image_base64: None,
+                image_mime: None,
             }),
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Failed to forget memory: {e}")),
+                image_base64: None,
+                image_mime: None,
             }),
         }
     }

@@ -172,6 +172,8 @@ impl Tool for SelfUpgradeTool {
                     "No git repository found at {}",
                     self.repo_dir.display()
                 )),
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -181,6 +183,8 @@ impl Tool for SelfUpgradeTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("git fetch failed: {e}")),
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -208,6 +212,8 @@ impl Tool for SelfUpgradeTool {
                 success: true,
                 output: format!("Already up to date (HEAD: {current_sha})."),
                 error: None,
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -220,12 +226,16 @@ impl Tool for SelfUpgradeTool {
                         "{commit_count} new commit(s) available ({current_sha} → {remote_sha}):\n{pending}"
                     ),
                     error: None,
+                    image_base64: None,
+                    image_mime: None,
                 });
             }
             return Ok(ToolResult {
                 success: true,
                 output: format!("Already up to date (HEAD: {current_sha}). Use force=true to rebuild anyway."),
                 error: None,
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -243,6 +253,8 @@ impl Tool for SelfUpgradeTool {
                 success: false,
                 output: msg,
                 error: Some("APPROVAL_REQUIRED: Self-upgrade will pull changes and rebuild. Re-call with approved=true to proceed.".into()),
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -255,6 +267,8 @@ impl Tool for SelfUpgradeTool {
                         success: false,
                         output: String::new(),
                         error: Some(format!("git pull failed: {e}")),
+                        image_base64: None,
+                        image_mime: None,
                     });
                 }
             };
@@ -303,6 +317,8 @@ impl Tool for SelfUpgradeTool {
                     success: false,
                     output: format!("Build failed ({current_sha} → {remote_sha})."),
                     error: Some(format!("cargo build --release:\n{stderr}")),
+                    image_base64: None,
+                    image_mime: None,
                 });
             }
             Err(e) => {
@@ -310,6 +326,8 @@ impl Tool for SelfUpgradeTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to run cargo: {e}")),
+                    image_base64: None,
+                    image_mime: None,
                 });
             }
         };
@@ -323,6 +341,8 @@ impl Tool for SelfUpgradeTool {
                 success: false,
                 output: "Build succeeded but copy failed.".into(),
                 error: Some(format!("cp to app bundle: {e}")),
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -392,6 +412,8 @@ impl Tool for SelfUpgradeTool {
                  Telegram notification sent. Restarting in ~5s.",
             ),
             error: None,
+            image_base64: None,
+            image_mime: None,
         })
     }
 }

@@ -60,6 +60,8 @@ impl Tool for MemoryRecallTool {
                 success: true,
                 output: "No memories found matching that query.".into(),
                 error: None,
+                image_base64: None,
+                image_mime: None,
             }),
             Ok(entries) => {
                 let mut output = format!("Found {} memories:\n", entries.len());
@@ -77,12 +79,16 @@ impl Tool for MemoryRecallTool {
                     success: true,
                     output,
                     error: None,
+                    image_base64: None,
+                    image_mime: None,
                 })
             }
             Err(e) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
                 error: Some(format!("Memory recall failed: {e}")),
+                image_base64: None,
+                image_mime: None,
             }),
         }
     }

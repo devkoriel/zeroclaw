@@ -166,6 +166,8 @@ impl Tool for ImageInfoTool {
                 error: Some(format!(
                     "Path not allowed: {path_str} (must be within workspace)"
                 )),
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -174,6 +176,8 @@ impl Tool for ImageInfoTool {
                 success: false,
                 output: String::new(),
                 error: Some(format!("File not found: {path_str}")),
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -190,6 +194,8 @@ impl Tool for ImageInfoTool {
                 error: Some(format!(
                     "Image too large: {file_size} bytes (max {MAX_IMAGE_BYTES} bytes)"
                 )),
+                image_base64: None,
+                image_mime: None,
             });
         }
 
@@ -224,6 +230,8 @@ impl Tool for ImageInfoTool {
             success: true,
             output,
             error: None,
+            image_base64: None,
+            image_mime: None,
         })
     }
 }
