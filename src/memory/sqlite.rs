@@ -4,6 +4,7 @@ use super::vector;
 use async_trait::async_trait;
 use chrono::Local;
 use rusqlite::{params, Connection};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
@@ -98,6 +99,15 @@ impl SqliteMemory {
                 INSERT INTO memories_fts(rowid, key, content)
                 VALUES (new.rowid, new.key, new.content);
             END;
+
+            -- Persistent conversation history keyed by sender
+            CREATE TABLE IF NOT EXISTS conversations (
+                sender_id   TEXT PRIMARY KEY,
+                history     TEXT NOT NULL,
+                subject     TEXT,
+                updated_at  TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_conversations_updated ON conversations(updated_at);
 
             -- Embedding cache with LRU eviction
             CREATE TABLE IF NOT EXISTS embedding_cache (
@@ -587,6 +597,59 @@ impl Memory for SqliteMemory {
             .lock()
             .map(|c| c.execute_batch("SELECT 1").is_ok())
             .unwrap_or(false)
+    }
+
+    async fn save_conversation(
+        &self,
+        sender_id: &str,
+        history_json: &str,
+        subject: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock error: {e}"))?;
+        let now = Local::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO conversations (sender_id, history, subject, updated_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(sender_id) DO UPDATE SET
+                history = excluded.history,
+                subject = COALESCE(excluded.subject, conversations.subject),
+                updated_at = excluded.updated_at",
+            params![sender_id, history_json, subject, now],
+        )?;
+        Ok(())
+    }
+
+    async fn load_conversation(&self, sender_id: &str) -> anyhow::Result<Option<String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock error: {e}"))?;
+        let mut stmt =
+            conn.prepare("SELECT history FROM conversations WHERE sender_id = ?1")?;
+        let result: Option<String> = stmt
+            .query_row(params![sender_id], |row| row.get(0))
+            .ok();
+        Ok(result)
+    }
+
+    async fn load_all_conversations(&self) -> anyhow::Result<HashMap<String, String>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock error: {e}"))?;
+        let mut stmt = conn.prepare("SELECT sender_id, history FROM conversations")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut map = HashMap::new();
+        for row in rows {
+            let (sender_id, history) = row?;
+            map.insert(sender_id, history);
+        }
+        Ok(map)
     }
 }
 
@@ -1331,6 +1394,72 @@ mod tests {
         assert_eq!(s, "my custom category");
         let back = SqliteMemory::str_to_category(&s);
         assert_eq!(back, cat);
+    }
+
+    // ── Conversation persistence tests ──────────────────────────
+
+    #[tokio::test]
+    async fn conversation_save_and_load() {
+        let (_tmp, mem) = temp_sqlite();
+        let history = r#"[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"}]"#;
+        mem.save_conversation("user1", history, Some("greeting"))
+            .await
+            .unwrap();
+
+        let loaded = mem.load_conversation("user1").await.unwrap();
+        assert!(loaded.is_some());
+        assert_eq!(loaded.unwrap(), history);
+    }
+
+    #[tokio::test]
+    async fn conversation_load_nonexistent() {
+        let (_tmp, mem) = temp_sqlite();
+        let loaded = mem.load_conversation("nobody").await.unwrap();
+        assert!(loaded.is_none());
+    }
+
+    #[tokio::test]
+    async fn conversation_upsert() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.save_conversation("u1", "[1]", Some("first"))
+            .await
+            .unwrap();
+        mem.save_conversation("u1", "[1,2]", None).await.unwrap();
+
+        let loaded = mem.load_conversation("u1").await.unwrap().unwrap();
+        assert_eq!(loaded, "[1,2]");
+    }
+
+    #[tokio::test]
+    async fn conversation_load_all() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.save_conversation("a", "[a]", Some("topic A"))
+            .await
+            .unwrap();
+        mem.save_conversation("b", "[b]", Some("topic B"))
+            .await
+            .unwrap();
+
+        let all = mem.load_all_conversations().await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all.get("a").unwrap(), "[a]");
+        assert_eq!(all.get("b").unwrap(), "[b]");
+    }
+
+    #[tokio::test]
+    async fn conversation_persists_across_reopen() {
+        let tmp = TempDir::new().unwrap();
+        {
+            let mem = SqliteMemory::new(tmp.path()).unwrap();
+            mem.save_conversation("persist_user", r#"[{"role":"user","content":"remember me"}]"#, Some("persistence test"))
+                .await
+                .unwrap();
+        }
+        // Reopen
+        let mem2 = SqliteMemory::new(tmp.path()).unwrap();
+        let loaded = mem2.load_conversation("persist_user").await.unwrap();
+        assert!(loaded.is_some());
+        assert!(loaded.unwrap().contains("remember me"));
     }
 
     #[test]

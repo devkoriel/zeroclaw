@@ -7,12 +7,17 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
-use crate::channels::{Channel, WhatsAppChannel};
+use crate::agent::loop_::{agent_turn, build_context, build_tool_instructions, trim_history};
+use crate::channels::{build_system_prompt, Channel, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
-use crate::providers::{self, Provider};
+use crate::observability::{self, Observer};
+use crate::providers::{self, ChatMessage, Provider};
 use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
+use crate::security::SecurityPolicy;
+use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
+use crate::{runtime, skills};
 use anyhow::Result;
 use axum::{
     body::Bytes,
@@ -22,6 +27,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use dashmap::DashMap;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -31,8 +37,8 @@ use tower_http::timeout::TimeoutLayer;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
-/// Request timeout (30s) — prevents slow-loris attacks
-pub const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// Request timeout (300s) — allows agent loop with tool execution
+pub const REQUEST_TIMEOUT_SECS: u64 = 300;
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
@@ -161,6 +167,12 @@ pub struct AppState {
     pub whatsapp: Option<Arc<WhatsAppChannel>>,
     /// `WhatsApp` app secret for webhook signature verification (`X-Hub-Signature-256`)
     pub whatsapp_app_secret: Option<Arc<str>>,
+    // ── Agent loop infrastructure ──
+    pub tools_registry: Arc<Vec<Box<dyn Tool>>>,
+    pub observer: Arc<dyn Observer>,
+    pub system_prompt: Arc<str>,
+    /// Per-user conversation history keyed by sender_id.
+    pub conversations: Arc<DashMap<String, Vec<ChatMessage>>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -181,21 +193,89 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
 
-    let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider(
-        config.default_provider.as_deref().unwrap_or("openrouter"),
-        config.api_key.as_deref(),
-        &config.reliability,
-    )?);
     let model = config
         .default_model
         .clone()
         .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
+    let provider: Arc<dyn Provider> = Arc::from(providers::create_routed_provider(
+        config.default_provider.as_deref().unwrap_or("openrouter"),
+        config.api_key.as_deref(),
+        &config.reliability,
+        &config.model_routes,
+        &model,
+    )?);
     let temperature = config.default_temperature;
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory(
         &config.memory,
         &config.workspace_dir,
         config.api_key.as_deref(),
     )?);
+
+    // ── Agent loop infrastructure ──────────────────────────────
+    let security = Arc::new(SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
+    let observer: Arc<dyn Observer> =
+        Arc::from(observability::create_observer(&config.observability));
+    let rt: Arc<dyn runtime::RuntimeAdapter> =
+        Arc::from(runtime::create_runtime(&config.runtime)?);
+    let composio_key = if config.composio.enabled {
+        config.composio.api_key.as_deref()
+    } else {
+        None
+    };
+    let tools_registry = Arc::new(tools::all_tools_with_runtime(
+        &security,
+        rt,
+        mem.clone(),
+        composio_key,
+        &config.browser,
+    ));
+
+    // Build system prompt with tool instructions
+    let loaded_skills = skills::load_skills(&config.workspace_dir);
+    let tool_descs: Vec<(&str, &str)> = vec![
+        ("shell", "Execute terminal commands. Use when: running local checks, build/test commands, diagnostics. Don't use when: a safer dedicated tool exists, or command is destructive without approval."),
+        ("file_read", "Read file contents. Use when: inspecting project files, configs, logs. Don't use when: a targeted search is enough."),
+        ("file_write", "Write file contents. Use when: applying focused edits, scaffolding files, updating docs/code. Don't use when: side effects are unclear or file ownership is uncertain."),
+        ("memory_store", "Save to memory. Use when: preserving durable preferences, decisions, key context. Don't use when: information is transient/noisy/sensitive without need."),
+        ("memory_recall", "Search memory. Use when: retrieving prior decisions, user preferences, historical context. Don't use when: answer is already in current context."),
+        ("memory_forget", "Delete a memory entry. Use when: memory is incorrect/stale or explicitly requested for removal. Don't use when: impact is uncertain."),
+        ("self_upgrade", "Check for and apply ZeroClaw updates. Use check_only=true to see pending changes; set check_only=false with approved=true to pull and rebuild."),
+        ("computer", "See the screen and control mouse/keyboard to interact with any application. Actions: screenshot (see screen via vision AI), click/double_click/right_click (mouse), type (keyboard), key (combos like cmd+c), scroll, open_app, cursor_position. Always screenshot first, then act."),
+    ];
+    let mut system_prompt_str = build_system_prompt(
+        &config.workspace_dir,
+        &model,
+        &tool_descs,
+        &loaded_skills,
+        Some(&config.identity),
+    );
+    system_prompt_str.push_str(&build_tool_instructions(&tools_registry));
+    let system_prompt: Arc<str> = Arc::from(system_prompt_str);
+    let conversations: Arc<DashMap<String, Vec<ChatMessage>>> = Arc::new(DashMap::new());
+
+    // Restore persisted conversations from SQLite so users can
+    // continue where they left off after a daemon restart.
+    match mem.load_all_conversations().await {
+        Ok(stored) => {
+            for (sender_id, history_json) in stored {
+                if let Ok(history) = serde_json::from_str::<Vec<ChatMessage>>(&history_json) {
+                    conversations.insert(sender_id, history);
+                }
+            }
+            if !conversations.is_empty() {
+                tracing::info!(
+                    "Restored {} persisted conversation(s)",
+                    conversations.len()
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to load persisted conversations: {e}");
+        }
+    }
 
     // Extract webhook secret for authentication
     let webhook_secret: Option<Arc<str>> = config
@@ -309,6 +389,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         idempotency_store,
         whatsapp: whatsapp_channel,
         whatsapp_app_secret,
+        tools_registry,
+        observer,
+        system_prompt,
+        conversations,
     };
 
     // Build router with middleware
@@ -394,6 +478,18 @@ async fn handle_pair(State(state): State<AppState>, headers: HeaderMap) -> impl 
 #[derive(serde::Deserialize)]
 pub struct WebhookBody {
     pub message: String,
+    /// Optional sender identifier for per-user conversation history.
+    /// If absent, defaults to "default" (single-user mode).
+    #[serde(default = "default_sender_id")]
+    pub sender_id: String,
+    /// Optional model override. When set, bypasses automatic routing.
+    /// Use `"hint:fast"` to force Gemini, or a full model name.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+fn default_sender_id() -> String {
+    "default".into()
 }
 
 /// POST /webhook — main webhook endpoint
@@ -473,6 +569,7 @@ async fn handle_webhook(
     }
 
     let message = &webhook_body.message;
+    let sender_id = &webhook_body.sender_id;
 
     if state.auto_save {
         let _ = state
@@ -481,21 +578,91 @@ async fn handle_webhook(
             .await;
     }
 
-    match state
-        .provider
-        .chat(message, &state.model, state.temperature)
-        .await
+    // ── Model selection: manual override → auto-route → default ──
+    // Check if this conversation already has prior exchanges (assistant messages).
+    // If so, follow-ups must stay on the primary model for context continuity.
+    let has_prior_exchange = state
+        .conversations
+        .get(sender_id)
+        .map_or(false, |history| {
+            history.iter().any(|m| m.role == "assistant")
+        });
+
+    let selected_model = if let Some(ref m) = webhook_body.model {
+        m.clone()
+    } else {
+        crate::agent::routing::select_model_hint(message, has_prior_exchange)
+            .map(String::from)
+            .unwrap_or_else(|| state.model.clone())
+    };
+
+    tracing::info!(
+        sender = sender_id.as_str(),
+        model = selected_model.as_str(),
+        auto_routed = webhook_body.model.is_none(),
+        "Webhook model selection"
+    );
+
+    // Build or retrieve per-user conversation history
+    let mut history = state
+        .conversations
+        .entry(sender_id.clone())
+        .or_insert_with(|| vec![ChatMessage::system(state.system_prompt.as_ref())])
+        .value()
+        .clone();
+
+    // Enrich message with memory context
+    let context = build_context(state.mem.as_ref(), message).await;
+    let enriched = if context.is_empty() {
+        message.clone()
+    } else {
+        format!("{context}{message}")
+    };
+    history.push(ChatMessage::user(&enriched));
+
+    match agent_turn(
+        state.provider.as_ref(),
+        &mut history,
+        &state.tools_registry,
+        state.observer.as_ref(),
+        &selected_model,
+        state.temperature,
+    )
+    .await
     {
         Ok(response) => {
-            let body = serde_json::json!({"response": response, "model": state.model});
+            trim_history(&mut history);
+            let subject = crate::agent::routing::extract_subject(&history);
+            let history_json = serde_json::to_string(&history).unwrap_or_default();
+            state
+                .conversations
+                .insert(sender_id.clone(), history);
+            let _ = state
+                .mem
+                .save_conversation(&sender_id, &history_json, subject.as_deref())
+                .await;
+            let body = serde_json::json!({
+                "response": response,
+                "model": selected_model,
+            });
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
+            trim_history(&mut history);
+            let subject = crate::agent::routing::extract_subject(&history);
+            let history_json = serde_json::to_string(&history).unwrap_or_default();
+            state
+                .conversations
+                .insert(sender_id.clone(), history);
+            let _ = state
+                .mem
+                .save_conversation(&sender_id, &history_json, subject.as_deref())
+                .await;
             tracing::error!(
-                "Webhook provider error: {}",
+                "Webhook agent error: {}",
                 providers::sanitize_api_error(&e.to_string())
             );
-            let err = serde_json::json!({"error": "LLM request failed"});
+            let err = serde_json::json!({"error": "Agent processing failed"});
             (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
         }
     }
@@ -669,6 +836,7 @@ async fn handle_whatsapp_message(
 mod tests {
     use super::*;
     use crate::memory::{Memory, MemoryCategory, MemoryEntry};
+    use crate::observability::NoopObserver;
     use crate::providers::Provider;
     use async_trait::async_trait;
     use axum::http::HeaderValue;
@@ -682,8 +850,8 @@ mod tests {
     }
 
     #[test]
-    fn security_timeout_is_30_seconds() {
-        assert_eq!(REQUEST_TIMEOUT_SECS, 30);
+    fn security_timeout_is_300_seconds() {
+        assert_eq!(REQUEST_TIMEOUT_SECS, 300);
     }
 
     #[test]
@@ -813,6 +981,10 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
             whatsapp: None,
             whatsapp_app_secret: None,
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::from("test"),
+            conversations: Arc::new(DashMap::new()),
         };
 
         let mut headers = HeaderMap::new();
@@ -820,6 +992,8 @@ mod tests {
 
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
+            sender_id: "test".into(),
+            model: None,
         }));
         let first = handle_webhook(State(state.clone()), headers.clone(), body)
             .await
@@ -828,6 +1002,8 @@ mod tests {
 
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
+            sender_id: "test".into(),
+            model: None,
         }));
         let second = handle_webhook(State(state), headers, body)
             .await

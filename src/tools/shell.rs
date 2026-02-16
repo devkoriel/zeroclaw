@@ -16,6 +16,15 @@ const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
 ];
 
+/// Extra PATH directories to prepend so child processes can find Homebrew
+/// and other common tools even when the daemon inherits minimal PATH from launchd.
+const EXTRA_PATH_DIRS: &[&str] = &[
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+];
+
 /// Shell command execution tool with sandboxing
 pub struct ShellTool {
     security: Arc<SecurityPolicy>,
@@ -112,7 +121,29 @@ impl Tool for ShellTool {
         cmd.env_clear();
 
         for var in SAFE_ENV_VARS {
-            if let Ok(val) = std::env::var(var) {
+            if *var == "PATH" {
+                // Prepend common tool directories so Homebrew etc. are reachable
+                // even when the daemon inherits minimal PATH from launchd.
+                let base = std::env::var("PATH").unwrap_or_default();
+                let mut full_path = String::new();
+                for dir in EXTRA_PATH_DIRS {
+                    if std::path::Path::new(dir).is_dir() {
+                        if !full_path.is_empty() {
+                            full_path.push(':');
+                        }
+                        full_path.push_str(dir);
+                    }
+                }
+                if !base.is_empty() {
+                    if !full_path.is_empty() {
+                        full_path.push(':');
+                    }
+                    full_path.push_str(&base);
+                }
+                if !full_path.is_empty() {
+                    cmd.env("PATH", full_path);
+                }
+            } else if let Ok(val) = std::env::var(var) {
                 cmd.env(var, val);
             }
         }
@@ -221,7 +252,8 @@ mod tests {
         let result = tool.execute(json!({"command": "rm -rf /"})).await.unwrap();
         assert!(!result.success);
         let error = result.error.as_deref().unwrap_or("");
-        assert!(error.contains("not allowed") || error.contains("high-risk"));
+        // Should be blocked by is_catastrophic()
+        assert!(error.contains("catastrophic") || error.contains("blocked"), "Expected catastrophic error, got: {}", error);
     }
 
     #[tokio::test]
@@ -334,6 +366,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shell_path_includes_extra_dirs() {
+        let tool = ShellTool::new(test_security_with_env_cmd(), test_runtime());
+        let result = tool
+            .execute(json!({"command": "echo $PATH"}))
+            .await
+            .unwrap();
+        assert!(result.success);
+        let path = result.output.trim();
+        // On macOS with Homebrew, /opt/homebrew/bin should be prepended.
+        // On CI without Homebrew the dir won't exist so it's skipped — that's fine.
+        if std::path::Path::new("/opt/homebrew/bin").is_dir() {
+            assert!(
+                path.contains("/opt/homebrew/bin"),
+                "PATH should include /opt/homebrew/bin when the directory exists: {path}"
+            );
+        }
+        // /usr/local/bin is common on most systems
+        if std::path::Path::new("/usr/local/bin").is_dir() {
+            assert!(
+                path.contains("/usr/local/bin"),
+                "PATH should include /usr/local/bin when the directory exists: {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn shell_requires_approval_for_medium_risk_command() {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
@@ -352,7 +410,7 @@ mod tests {
             .error
             .as_deref()
             .unwrap_or("")
-            .contains("explicit approval"));
+            .contains("APPROVAL_REQUIRED"));
 
         let allowed = tool
             .execute(json!({

@@ -7,21 +7,22 @@ use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
+use std::collections::HashSet;
 use std::fmt::Write;
 use std::io::Write as IoWrite;
 use std::sync::Arc;
 use std::time::Instant;
 
 /// Maximum agentic tool-use iterations per user message to prevent runaway loops.
-const MAX_TOOL_ITERATIONS: usize = 10;
+pub const MAX_TOOL_ITERATIONS: usize = 10;
 
 /// Maximum number of non-system messages to keep in history.
 /// When exceeded, the oldest messages are dropped (system prompt is always preserved).
-const MAX_HISTORY_MESSAGES: usize = 50;
+pub const MAX_HISTORY_MESSAGES: usize = 50;
 
 /// Trim conversation history to prevent unbounded growth.
 /// Preserves the system prompt (first message if role=system) and the most recent messages.
-fn trim_history(history: &mut Vec<ChatMessage>) {
+pub fn trim_history(history: &mut Vec<ChatMessage>) {
     // Nothing to trim if within limit
     let has_system = history.first().map_or(false, |m| m.role == "system");
     let non_system_count = if has_system {
@@ -40,7 +41,7 @@ fn trim_history(history: &mut Vec<ChatMessage>) {
 }
 
 /// Build context preamble by searching memory for relevant entries
-async fn build_context(mem: &dyn Memory, user_msg: &str) -> String {
+pub async fn build_context(mem: &dyn Memory, user_msg: &str) -> String {
     let mut context = String::new();
 
     // Pull relevant memories for this message
@@ -58,7 +59,7 @@ async fn build_context(mem: &dyn Memory, user_msg: &str) -> String {
 }
 
 /// Find a tool by name in the registry.
-fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
+pub fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
     tools.iter().find(|t| t.name() == name).map(|t| t.as_ref())
 }
 
@@ -72,7 +73,7 @@ fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool>
 /// ```
 ///
 /// Also supports JSON with `tool_calls` array from OpenAI-format responses.
-fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
+pub fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
     let mut text_parts = Vec::new();
     let mut calls = Vec::new();
     let mut remaining = response;
@@ -157,14 +158,14 @@ fn parse_tool_calls(response: &str) -> (String, Vec<ParsedToolCall>) {
 }
 
 #[derive(Debug)]
-struct ParsedToolCall {
-    name: String,
-    arguments: serde_json::Value,
+pub struct ParsedToolCall {
+    pub name: String,
+    pub arguments: serde_json::Value,
 }
 
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
-async fn agent_turn(
+pub async fn agent_turn(
     provider: &dyn Provider,
     history: &mut Vec<ChatMessage>,
     tools_registry: &[Box<dyn Tool>],
@@ -172,6 +173,12 @@ async fn agent_turn(
     model: &str,
     temperature: f64,
 ) -> Result<String> {
+    // Self-approval guard: track tools that returned APPROVAL_REQUIRED in this
+    // turn so the LLM cannot self-approve by retrying with approved=true.
+    // A new turn (new webhook call) starts with an empty set, allowing
+    // user-approved retries to pass through.
+    let mut denied_tools: HashSet<String> = HashSet::new();
+
     for _iteration in 0..MAX_TOOL_ITERATIONS {
         let response = provider
             .chat_with_history(history, model, temperature)
@@ -199,14 +206,39 @@ async fn agent_turn(
         let mut tool_results = String::new();
         for call in &tool_calls {
             let start = Instant::now();
+            // Self-approval guard: strip approved=true if this tool was
+            // denied earlier in this turn to prevent LLM self-approval.
+            let sanitized_args = {
+                let mut args = call.arguments.clone();
+                if denied_tools.contains(&call.name) {
+                    if let Some(obj) = args.as_object_mut() {
+                        if obj.get("approved").and_then(|v| v.as_bool()).unwrap_or(false) {
+                            obj.insert(
+                                "approved".into(),
+                                serde_json::Value::Bool(false),
+                            );
+                        }
+                    }
+                }
+                args
+            };
+
             let result = if let Some(tool) = find_tool(tools_registry, &call.name) {
-                match tool.execute(call.arguments.clone()).await {
+                match tool.execute(sanitized_args).await {
                     Ok(r) => {
                         observer.record_event(&ObserverEvent::ToolCall {
                             tool: call.name.clone(),
                             duration: start.elapsed(),
                             success: r.success,
                         });
+                        // Track APPROVAL_REQUIRED denials for the self-approval guard
+                        if !r.success {
+                            if let Some(ref err) = r.error {
+                                if err.contains("APPROVAL_REQUIRED") {
+                                    denied_tools.insert(call.name.clone());
+                                }
+                            }
+                        }
                         if r.success {
                             r.output
                         } else {
@@ -245,7 +277,7 @@ async fn agent_turn(
 
 /// Build the tool instruction block for the system prompt so the LLM knows
 /// how to invoke tools.
-fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
+pub fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
     let mut instructions = String::new();
     instructions.push_str("\n## Tool Use Protocol\n\n");
     instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");

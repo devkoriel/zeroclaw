@@ -109,6 +109,7 @@ fn resolve_api_key(name: &str, api_key: Option<&str>) -> Option<String> {
         "anthropic" => vec!["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
         "openrouter" => vec!["OPENROUTER_API_KEY"],
         "openai" => vec!["OPENAI_API_KEY"],
+        "gemini" | "google" | "google-gemini" => vec!["GEMINI_API_KEY", "GOOGLE_API_KEY"],
         "venice" => vec!["VENICE_API_KEY"],
         "groq" => vec!["GROQ_API_KEY"],
         "mistral" => vec!["MISTRAL_API_KEY"],
@@ -340,14 +341,22 @@ pub fn create_routed_provider(
         }
     }
 
-    // Create each provider (with its own resilience wrapper)
+    // Create each provider (with its own resilience wrapper).
+    // The primary provider uses the global api_key; route providers only use
+    // their route-specific key (if any), letting each provider's own env var
+    // resolution handle authentication. This prevents the global key from
+    // overriding provider-specific auth (e.g. GEMINI_API_KEY).
     let mut providers: Vec<(String, Box<dyn Provider>)> = Vec::new();
     for name in &needed {
-        let key = model_routes
+        let route_key = model_routes
             .iter()
             .find(|r| &r.provider == name)
-            .and_then(|r| r.api_key.as_deref())
-            .or(api_key);
+            .and_then(|r| r.api_key.as_deref());
+        let key = if name == primary_name {
+            route_key.or(api_key)
+        } else {
+            route_key
+        };
         match create_resilient_provider(name, key, reliability) {
             Ok(provider) => providers.push((name.clone(), provider)),
             Err(e) => {

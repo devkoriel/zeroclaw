@@ -31,11 +31,16 @@ impl Tool for FileWriteTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Relative path to the file within the workspace"
+                    "description": "Path to the file (relative to workspace, or absolute with approval)"
                 },
                 "content": {
                     "type": "string",
                     "description": "Content to write to the file"
+                },
+                "approved": {
+                    "type": "boolean",
+                    "description": "Set true after user explicitly approves writing to restricted paths",
+                    "default": false
                 }
             },
             "required": ["path", "content"]
@@ -53,16 +58,31 @@ impl Tool for FileWriteTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'content' parameter"))?;
 
+        let approved = args
+            .get("approved")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         // Security check: validate path is within workspace
-        if !self.security.is_path_allowed(path) {
+        let path_allowed = self.security.is_path_allowed(path);
+        if !path_allowed && !approved {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Path not allowed by security policy: {path}")),
+                error: Some(format!(
+                    "APPROVAL_REQUIRED: Path `{path}` is outside the allowed workspace. \
+                     Ask the user for explicit approval before proceeding."
+                )),
             });
         }
 
-        let full_path = self.security.workspace_dir.join(path);
+        // Determine full path: approved absolute paths are used directly,
+        // otherwise resolve relative to workspace.
+        let full_path = if approved && std::path::Path::new(path).is_absolute() {
+            std::path::PathBuf::from(path)
+        } else {
+            self.security.workspace_dir.join(path)
+        };
 
         let Some(parent) = full_path.parent() else {
             return Ok(ToolResult {
@@ -87,7 +107,8 @@ impl Tool for FileWriteTool {
             }
         };
 
-        if !self.security.is_resolved_path_allowed(&resolved_parent) {
+        // Workspace containment check (skip when user-approved)
+        if !approved && !self.security.is_resolved_path_allowed(&resolved_parent) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -108,7 +129,7 @@ impl Tool for FileWriteTool {
 
         let resolved_target = resolved_parent.join(file_name);
 
-        // If the target already exists and is a symlink, refuse to follow it
+        // Symlink check always enforced (even with approval)
         if let Ok(meta) = tokio::fs::symlink_metadata(&resolved_target).await {
             if meta.file_type().is_symlink() {
                 return Ok(ToolResult {
@@ -146,6 +167,7 @@ mod tests {
         Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: workspace,
+            workspace_only: true,
             ..SecurityPolicy::default()
         })
     }
@@ -246,20 +268,20 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("not allowed"));
+        assert!(result.error.as_ref().unwrap().contains("APPROVAL_REQUIRED"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
-    async fn file_write_blocks_absolute_path() {
+    async fn file_write_blocks_absolute_path_without_approval() {
         let tool = FileWriteTool::new(test_security(std::env::temp_dir()));
         let result = tool
             .execute(json!({"path": "/etc/evil", "content": "bad"}))
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("not allowed"));
+        assert!(result.error.as_ref().unwrap().contains("APPROVAL_REQUIRED"));
     }
 
     #[tokio::test]

@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// A single memory entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,4 +66,24 @@ pub trait Memory: Send + Sync {
 
     /// Health check
     async fn health_check(&self) -> bool;
+
+    /// Save conversation history for a sender. Default no-op for backends that don't support it.
+    async fn save_conversation(
+        &self,
+        _sender_id: &str,
+        _history_json: &str,
+        _subject: Option<&str>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Load conversation history for a sender. Returns serialized JSON.
+    async fn load_conversation(&self, _sender_id: &str) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
+    /// Load all conversations. Returns sender_id → serialized JSON history.
+    async fn load_all_conversations(&self) -> anyhow::Result<HashMap<String, String>> {
+        Ok(HashMap::new())
+    }
 }

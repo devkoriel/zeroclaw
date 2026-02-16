@@ -1,6 +1,7 @@
 pub mod browser;
 pub mod browser_open;
 pub mod composio;
+pub mod computer;
 pub mod file_read;
 pub mod file_write;
 pub mod image_info;
@@ -8,12 +9,14 @@ pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
 pub mod screenshot;
+pub mod self_upgrade;
 pub mod shell;
 pub mod traits;
 
 pub use browser::BrowserTool;
 pub use browser_open::BrowserOpenTool;
 pub use composio::ComposioTool;
+pub use computer::ComputerTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
 pub use image_info::ImageInfoTool;
@@ -21,6 +24,7 @@ pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
 pub use screenshot::ScreenshotTool;
+pub use self_upgrade::SelfUpgradeTool;
 pub use shell::ShellTool;
 pub use traits::Tool;
 #[allow(unused_imports)]
@@ -99,6 +103,16 @@ pub fn all_tools_with_runtime(
     tools.push(Box::new(ScreenshotTool::new(security.clone())));
     tools.push(Box::new(ImageInfoTool::new(security.clone())));
 
+    // Self-upgrade tool
+    tools.push(Box::new(SelfUpgradeTool::new()));
+
+    // Computer-use tool (screen vision + GUI automation)
+    let gemini_key = std::env::var("GEMINI_API_KEY")
+        .or_else(|_| std::env::var("GOOGLE_API_KEY"))
+        .ok()
+        .filter(|k| !k.trim().is_empty());
+    tools.push(Box::new(ComputerTool::new(security.clone(), gemini_key)));
+
     if let Some(key) = composio_key {
         if !key.is_empty() {
             tools.push(Box::new(ComposioTool::new(key)));
@@ -141,6 +155,10 @@ mod tests {
         let tools = all_tools(&security, mem, None, &browser);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
+        assert!(
+            names.contains(&"computer"),
+            "computer tool missing from registry. Found: {names:?}"
+        );
     }
 
     #[test]

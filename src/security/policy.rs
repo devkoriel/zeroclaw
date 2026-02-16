@@ -98,47 +98,51 @@ impl Default for SecurityPolicy {
         Self {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: PathBuf::from("."),
-            workspace_only: true,
+            workspace_only: false,
             allowed_commands: vec![
-                "git".into(),
-                "npm".into(),
-                "cargo".into(),
-                "ls".into(),
-                "cat".into(),
-                "grep".into(),
-                "find".into(),
-                "echo".into(),
-                "pwd".into(),
-                "wc".into(),
-                "head".into(),
-                "tail".into(),
+                // Core shell
+                "ls".into(), "cat".into(), "grep".into(), "find".into(),
+                "echo".into(), "pwd".into(), "wc".into(), "head".into(),
+                "tail".into(), "sort".into(), "uniq".into(), "tr".into(),
+                "cut".into(), "awk".into(), "sed".into(), "tee".into(),
+                "xargs".into(), "env".into(), "which".into(), "file".into(),
+                "stat".into(), "date".into(), "whoami".into(), "hostname".into(),
+                "uname".into(), "df".into(), "du".into(), "ps".into(),
+                "top".into(), "lsof".into(), "killall".into(),
+                // File operations
+                "mkdir".into(), "touch".into(), "cp".into(), "mv".into(),
+                "rm".into(), "ln".into(), "chmod".into(), "chown".into(),
+                "tar".into(), "zip".into(), "unzip".into(), "gzip".into(),
+                "gunzip".into(), "trash".into(),
+                // Dev tools
+                "git".into(), "cargo".into(), "rustc".into(), "rustup".into(),
+                "npm".into(), "npx".into(), "node".into(), "yarn".into(),
+                "pnpm".into(), "bun".into(), "deno".into(),
+                "python3".into(), "python".into(), "pip3".into(), "pip".into(),
+                "go".into(), "make".into(), "cmake".into(), "gcc".into(),
+                // Package managers
+                "brew".into(), "apt".into(), "apt-get".into(), "dnf".into(),
+                // Network
+                "curl".into(), "wget".into(), "ssh".into(), "scp".into(),
+                "rsync".into(), "ping".into(), "dig".into(), "nslookup".into(),
+                // System
+                "sudo".into(), "launchctl".into(), "open".into(),
+                "defaults".into(), "diskutil".into(), "softwareupdate".into(),
+                "pmset".into(), "networksetup".into(), "scutil".into(),
+                // Containers
+                "docker".into(), "docker-compose".into(), "podman".into(),
+                "kubectl".into(), "helm".into(), "terraform".into(),
             ],
             forbidden_paths: vec![
-                // System directories (blocked even when workspace_only=false)
-                "/etc".into(),
-                "/root".into(),
-                "/home".into(),
-                "/usr".into(),
-                "/bin".into(),
-                "/sbin".into(),
-                "/lib".into(),
-                "/opt".into(),
                 "/boot".into(),
                 "/dev".into(),
                 "/proc".into(),
                 "/sys".into(),
-                "/var".into(),
-                "/tmp".into(),
-                // Sensitive dotfiles
-                "~/.ssh".into(),
-                "~/.gnupg".into(),
-                "~/.aws".into(),
-                "~/.config".into(),
             ],
-            max_actions_per_hour: 20,
+            max_actions_per_hour: 100,
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
-            block_high_risk_commands: true,
+            block_high_risk_commands: false,
             tracker: ActionTracker::new(),
         }
     }
@@ -288,7 +292,61 @@ impl SecurityPolicy {
         }
     }
 
+    /// Commands that are NEVER allowed, even with explicit user approval.
+    /// These are system-level destructive operations with no safe use case
+    /// for an AI agent.
+    pub fn is_catastrophic(command: &str) -> bool {
+        let lower = command.to_ascii_lowercase();
+
+        // Fork bomb
+        if lower.contains(":(){:|:&};:") {
+            return true;
+        }
+
+        // dd writing to device files
+        if lower.contains("dd ") && lower.contains("of=/dev/") {
+            return true;
+        }
+
+        // Normalize command separators for per-segment analysis
+        let mut normalized = lower;
+        for sep in ["&&", "||"] {
+            normalized = normalized.replace(sep, "\x00");
+        }
+        for sep in ['\n', ';', '|'] {
+            normalized = normalized.replace(sep, "\x00");
+        }
+
+        for segment in normalized.split('\x00') {
+            let words: Vec<&str> = segment.split_whitespace().collect();
+            let Some(&first) = words.first() else {
+                continue;
+            };
+            let base = first.rsplit('/').next().unwrap_or("");
+
+            match base {
+                "shutdown" | "reboot" | "halt" | "poweroff" => return true,
+                _ if base.starts_with("mkfs") => return true,
+                "rm" => {
+                    let has_rf = words.iter().any(|w| {
+                        *w == "-rf" || *w == "-fr" || (w.starts_with('-') && w.contains('r') && w.contains('f'))
+                    });
+                    let targets_root = words.iter().any(|w| *w == "/" || *w == "/*");
+                    if has_rf && targets_root {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        false
+    }
+
     /// Validate full command execution policy (allowlist + risk gate).
+    ///
+    /// Returns `APPROVAL_REQUIRED` errors for medium/high-risk commands when
+    /// `approved` is false, allowing the agent to ask the user for permission.
     pub fn validate_command_execution(
         &self,
         command: &str,
@@ -298,18 +356,23 @@ impl SecurityPolicy {
             return Err(format!("Command not allowed by security policy: {command}"));
         }
 
+        // Catastrophic commands are permanently blocked, no approval override
+        if Self::is_catastrophic(command) {
+            return Err(format!(
+                "Command permanently blocked: `{command}` is catastrophic and cannot be executed even with approval."
+            ));
+        }
+
         let risk = self.command_risk_level(command);
 
-        if risk == CommandRiskLevel::High {
-            if self.block_high_risk_commands {
-                return Err("Command blocked: high-risk command is disallowed by policy".into());
-            }
-            if self.autonomy == AutonomyLevel::Supervised && !approved {
-                return Err(
-                    "Command requires explicit approval (approved=true): high-risk operation"
-                        .into(),
-                );
-            }
+        if risk == CommandRiskLevel::High
+            && self.autonomy == AutonomyLevel::Supervised
+            && !approved
+        {
+            return Err(format!(
+                "APPROVAL_REQUIRED: High-risk command `{command}`. \
+                 Ask the user for explicit approval before proceeding."
+            ));
         }
 
         if risk == CommandRiskLevel::Medium
@@ -317,9 +380,10 @@ impl SecurityPolicy {
             && self.require_approval_for_medium_risk
             && !approved
         {
-            return Err(
-                "Command requires explicit approval (approved=true): medium-risk operation".into(),
-            );
+            return Err(format!(
+                "APPROVAL_REQUIRED: Medium-risk command `{command}`. \
+                 Ask the user for explicit approval before proceeding."
+            ));
         }
 
         Ok(risk)
@@ -573,7 +637,11 @@ mod tests {
 
     #[test]
     fn blocked_commands_basic() {
-        let p = default_policy();
+        // Use restrictive policy with small allowlist
+        let p = SecurityPolicy {
+            allowed_commands: vec!["ls".into(), "cat".into(), "echo".into()],
+            ..SecurityPolicy::default()
+        };
         assert!(!p.is_command_allowed("rm -rf /"));
         assert!(!p.is_command_allowed("sudo apt install"));
         assert!(!p.is_command_allowed("curl http://evil.com"));
@@ -592,7 +660,11 @@ mod tests {
 
     #[test]
     fn full_autonomy_still_uses_allowlist() {
-        let p = full_policy();
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["ls".into()],
+            ..SecurityPolicy::default()
+        };
         assert!(p.is_command_allowed("ls"));
         assert!(!p.is_command_allowed("rm -rf /"));
     }
@@ -613,7 +685,11 @@ mod tests {
 
     #[test]
     fn command_with_pipes_validates_all_segments() {
-        let p = default_policy();
+        // Use restrictive policy with small allowlist
+        let p = SecurityPolicy {
+            allowed_commands: vec!["ls".into(), "grep".into(), "cat".into(), "wc".into(), "echo".into()],
+            ..SecurityPolicy::default()
+        };
         // Both sides of the pipe are in the allowlist
         assert!(p.is_command_allowed("ls | grep foo"));
         assert!(p.is_command_allowed("cat file.txt | wc -l"));
@@ -690,23 +766,67 @@ mod tests {
 
         let denied = p.validate_command_execution("touch test.txt", false);
         assert!(denied.is_err());
-        assert!(denied.unwrap_err().contains("requires explicit approval"),);
+        assert!(denied.unwrap_err().contains("APPROVAL_REQUIRED"));
 
         let allowed = p.validate_command_execution("touch test.txt", true);
         assert_eq!(allowed.unwrap(), CommandRiskLevel::Medium);
     }
 
     #[test]
-    fn validate_command_blocks_high_risk_by_default() {
+    fn validate_catastrophic_blocked_even_with_approval() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            allowed_commands: vec!["rm".into(), "shutdown".into()],
+            ..SecurityPolicy::default()
+        };
+
+        let result = p.validate_command_execution("rm -rf /", true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("catastrophic"));
+
+        let result = p.validate_command_execution("shutdown -h now", true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("catastrophic"));
+    }
+
+    #[test]
+    fn validate_high_risk_approval_gated() {
         let p = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             allowed_commands: vec!["rm".into()],
             ..SecurityPolicy::default()
         };
 
-        let result = p.validate_command_execution("rm -rf /tmp/test", true);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("high-risk"));
+        // Without approval → APPROVAL_REQUIRED
+        let denied = p.validate_command_execution("rm -rf /tmp/test", false);
+        assert!(denied.is_err());
+        assert!(denied.unwrap_err().contains("APPROVAL_REQUIRED"));
+
+        // With approval → allowed (not catastrophic since it targets /tmp, not /)
+        let allowed = p.validate_command_execution("rm -rf /tmp/test", true);
+        assert_eq!(allowed.unwrap(), CommandRiskLevel::High);
+    }
+
+    #[test]
+    fn is_catastrophic_coverage() {
+        // Catastrophic
+        assert!(SecurityPolicy::is_catastrophic("rm -rf /"));
+        assert!(SecurityPolicy::is_catastrophic("rm -fr /"));
+        assert!(SecurityPolicy::is_catastrophic("rm -rf /*"));
+        assert!(SecurityPolicy::is_catastrophic(":(){:|:&};:"));
+        assert!(SecurityPolicy::is_catastrophic("dd if=/dev/zero of=/dev/sda"));
+        assert!(SecurityPolicy::is_catastrophic("shutdown -h now"));
+        assert!(SecurityPolicy::is_catastrophic("reboot"));
+        assert!(SecurityPolicy::is_catastrophic("halt"));
+        assert!(SecurityPolicy::is_catastrophic("poweroff"));
+        assert!(SecurityPolicy::is_catastrophic("mkfs.ext4 /dev/sda1"));
+
+        // Not catastrophic (normal high-risk)
+        assert!(!SecurityPolicy::is_catastrophic("rm -rf /tmp/test"));
+        assert!(!SecurityPolicy::is_catastrophic("rm -rf ./build"));
+        assert!(!SecurityPolicy::is_catastrophic("sudo ls"));
+        assert!(!SecurityPolicy::is_catastrophic("curl https://example.com"));
+        assert!(!SecurityPolicy::is_catastrophic("chmod 755 script.sh"));
     }
 
     // ── is_path_allowed ─────────────────────────────────────
@@ -730,7 +850,10 @@ mod tests {
 
     #[test]
     fn absolute_paths_blocked_when_workspace_only() {
-        let p = default_policy();
+        let p = SecurityPolicy {
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
         assert!(!p.is_path_allowed("/etc/passwd"));
         assert!(!p.is_path_allowed("/root/.ssh/id_rsa"));
         assert!(!p.is_path_allowed("/tmp/file.txt"));
@@ -748,8 +871,12 @@ mod tests {
 
     #[test]
     fn forbidden_paths_blocked() {
+        // Use restrictive policy with comprehensive forbidden paths
         let p = SecurityPolicy {
             workspace_only: false,
+            forbidden_paths: vec![
+                "/etc".into(), "/root".into(), "~/.ssh".into(), "~/.gnupg".into()
+            ],
             ..SecurityPolicy::default()
         };
         assert!(!p.is_path_allowed("/etc/passwd"));
@@ -805,13 +932,13 @@ mod tests {
     fn default_policy_has_sane_values() {
         let p = SecurityPolicy::default();
         assert_eq!(p.autonomy, AutonomyLevel::Supervised);
-        assert!(p.workspace_only);
+        assert!(!p.workspace_only);
         assert!(!p.allowed_commands.is_empty());
         assert!(!p.forbidden_paths.is_empty());
         assert!(p.max_actions_per_hour > 0);
         assert!(p.max_cost_per_day_cents > 0);
         assert!(p.require_approval_for_medium_risk);
-        assert!(p.block_high_risk_commands);
+        assert!(!p.block_high_risk_commands);
     }
 
     // ── ActionTracker / rate limiting ───────────────────────
@@ -883,15 +1010,22 @@ mod tests {
 
     #[test]
     fn command_injection_semicolon_blocked() {
-        let p = default_policy();
-        // First word is "ls;" (with semicolon) — doesn't match "ls" in allowlist.
-        // This is a safe default: chained commands are blocked.
+        // Use restrictive policy with small allowlist
+        let p = SecurityPolicy {
+            allowed_commands: vec!["ls".into(), "echo".into()],
+            ..SecurityPolicy::default()
+        };
+        // rm not in allowlist, so this should be blocked
         assert!(!p.is_command_allowed("ls; rm -rf /"));
     }
 
     #[test]
     fn command_injection_semicolon_no_space() {
-        let p = default_policy();
+        // Use restrictive policy with small allowlist
+        let p = SecurityPolicy {
+            allowed_commands: vec!["ls".into(), "echo".into()],
+            ..SecurityPolicy::default()
+        };
         assert!(!p.is_command_allowed("ls;rm -rf /"));
     }
 
@@ -911,15 +1045,23 @@ mod tests {
 
     #[test]
     fn command_with_env_var_prefix() {
-        let p = default_policy();
-        // "FOO=bar" is the first word — not in allowlist
+        // Use restrictive policy with small allowlist
+        let p = SecurityPolicy {
+            allowed_commands: vec!["ls".into(), "echo".into()],
+            ..SecurityPolicy::default()
+        };
+        // rm not in allowlist
         assert!(!p.is_command_allowed("FOO=bar rm -rf /"));
     }
 
     #[test]
     fn command_newline_injection_blocked() {
-        let p = default_policy();
-        // Newline splits into two commands; "rm" is not in allowlist
+        // Use restrictive policy with small allowlist
+        let p = SecurityPolicy {
+            allowed_commands: vec!["ls".into(), "echo".into()],
+            ..SecurityPolicy::default()
+        };
+        // rm not in allowlist
         assert!(!p.is_command_allowed("ls\nrm -rf /"));
         // Both allowed — OK
         assert!(p.is_command_allowed("ls\necho hello"));
@@ -927,7 +1069,11 @@ mod tests {
 
     #[test]
     fn command_injection_and_chain_blocked() {
-        let p = default_policy();
+        // Use restrictive policy with small allowlist
+        let p = SecurityPolicy {
+            allowed_commands: vec!["ls".into(), "echo".into()],
+            ..SecurityPolicy::default()
+        };
         assert!(!p.is_command_allowed("ls && rm -rf /"));
         assert!(!p.is_command_allowed("echo ok && curl http://evil.com"));
         // Both allowed — OK
@@ -936,7 +1082,11 @@ mod tests {
 
     #[test]
     fn command_injection_or_chain_blocked() {
-        let p = default_policy();
+        // Use restrictive policy with small allowlist
+        let p = SecurityPolicy {
+            allowed_commands: vec!["ls".into(), "echo".into()],
+            ..SecurityPolicy::default()
+        };
         assert!(!p.is_command_allowed("ls || rm -rf /"));
         // Both allowed — OK
         assert!(p.is_command_allowed("ls || echo fallback"));
@@ -957,7 +1107,11 @@ mod tests {
 
     #[test]
     fn command_env_var_prefix_with_allowed_cmd() {
-        let p = default_policy();
+        // Use restrictive policy with small allowlist
+        let p = SecurityPolicy {
+            allowed_commands: vec!["ls".into(), "grep".into()],
+            ..SecurityPolicy::default()
+        };
         // env assignment + allowed command — OK
         assert!(p.is_command_allowed("FOO=bar ls"));
         assert!(p.is_command_allowed("LANG=C grep pattern file"));
@@ -1000,6 +1154,7 @@ mod tests {
     fn path_home_tilde_ssh() {
         let p = SecurityPolicy {
             workspace_only: false,
+            forbidden_paths: vec!["~/.ssh".into(), "~/.gnupg".into()],
             ..SecurityPolicy::default()
         };
         assert!(!p.is_path_allowed("~/.ssh/id_rsa"));
@@ -1010,6 +1165,7 @@ mod tests {
     fn path_var_run_blocked() {
         let p = SecurityPolicy {
             workspace_only: false,
+            forbidden_paths: vec!["/var".into()],
             ..SecurityPolicy::default()
         };
         assert!(!p.is_path_allowed("/var/run/docker.sock"));
@@ -1078,6 +1234,7 @@ mod tests {
         let p = SecurityPolicy {
             autonomy: AutonomyLevel::Full,
             workspace_only: false,
+            forbidden_paths: vec!["/etc".into(), "/root".into()],
             ..SecurityPolicy::default()
         };
         assert!(!p.is_path_allowed("/etc/shadow"));
@@ -1114,7 +1271,11 @@ mod tests {
 
     #[test]
     fn checklist_root_path_blocked() {
-        let p = default_policy();
+        let p = SecurityPolicy {
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        };
+        // With workspace_only, absolute paths are blocked
         assert!(!p.is_path_allowed("/"));
         assert!(!p.is_path_allowed("/anything"));
     }
@@ -1125,10 +1286,8 @@ mod tests {
             workspace_only: false,
             ..SecurityPolicy::default()
         };
-        for dir in [
-            "/etc", "/root", "/home", "/usr", "/bin", "/sbin", "/lib", "/opt", "/boot", "/dev",
-            "/proc", "/sys", "/var", "/tmp",
-        ] {
+        // Only 4 dirs are blocked by default now
+        for dir in ["/boot", "/dev", "/proc", "/sys"] {
             assert!(
                 !p.is_path_allowed(dir),
                 "System dir should be blocked: {dir}"
@@ -1136,6 +1295,13 @@ mod tests {
             assert!(
                 !p.is_path_allowed(&format!("{dir}/subpath")),
                 "Subpath of system dir should be blocked: {dir}/subpath"
+            );
+        }
+        // Other dirs are allowed with relaxed defaults
+        for dir in ["/etc", "/root", "/home", "/usr", "/bin", "/sbin", "/lib", "/opt", "/var", "/tmp"] {
+            assert!(
+                p.is_path_allowed(dir),
+                "Dir should be allowed with relaxed defaults: {dir}"
             );
         }
     }
@@ -1146,6 +1312,7 @@ mod tests {
             workspace_only: false,
             ..SecurityPolicy::default()
         };
+        // With relaxed defaults, sensitive dotfiles are no longer blocked by default
         for path in [
             "~/.ssh/id_rsa",
             "~/.gnupg/secring.gpg",
@@ -1153,10 +1320,21 @@ mod tests {
             "~/.config/secrets",
         ] {
             assert!(
-                !p.is_path_allowed(path),
-                "Sensitive dotfile should be blocked: {path}"
+                p.is_path_allowed(path),
+                "With relaxed defaults, dotfile should be allowed: {path}"
             );
         }
+    }
+
+    #[test]
+    fn zeroclaw_dir_is_approval_gated_not_hard_blocked() {
+        // ~/.zeroclaw is no longer in default forbidden_paths — it is
+        // protected via the file tool approval mechanism instead.
+        let p = SecurityPolicy::default();
+        assert!(
+            !p.forbidden_paths.iter().any(|f| f == "~/.zeroclaw"),
+            "~/.zeroclaw should not be in forbidden_paths (approval-gated instead)"
+        );
     }
 
     #[test]
@@ -1196,26 +1374,33 @@ mod tests {
     fn checklist_default_policy_is_workspace_only() {
         let p = SecurityPolicy::default();
         assert!(
-            p.workspace_only,
-            "Default policy must be workspace_only=true"
+            !p.workspace_only,
+            "Default policy workspace_only is now false"
         );
     }
 
     #[test]
     fn checklist_default_forbidden_paths_comprehensive() {
         let p = SecurityPolicy::default();
-        // Must contain all critical system dirs
-        for dir in ["/etc", "/root", "/proc", "/sys", "/dev", "/var", "/tmp"] {
+        // New relaxed defaults only block 4 critical system dirs
+        for dir in ["/boot", "/dev", "/proc", "/sys"] {
             assert!(
                 p.forbidden_paths.iter().any(|f| f == dir),
                 "Default forbidden_paths must include {dir}"
             );
         }
-        // Must contain sensitive dotfiles
+        // Previously forbidden paths are no longer blocked by default
+        for dir in ["/etc", "/root", "/var", "/tmp"] {
+            assert!(
+                !p.forbidden_paths.iter().any(|f| f == dir),
+                "{dir} should not be in default forbidden_paths (relaxed defaults)"
+            );
+        }
+        // Sensitive dotfiles are also no longer forbidden by default
         for dot in ["~/.ssh", "~/.gnupg", "~/.aws"] {
             assert!(
-                p.forbidden_paths.iter().any(|f| f == dot),
-                "Default forbidden_paths must include {dot}"
+                !p.forbidden_paths.iter().any(|f| f == dot),
+                "{dot} should not be in default forbidden_paths (relaxed defaults)"
             );
         }
     }

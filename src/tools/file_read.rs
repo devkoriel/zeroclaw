@@ -31,7 +31,12 @@ impl Tool for FileReadTool {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Relative path to the file within the workspace"
+                    "description": "Path to the file (relative to workspace, or absolute with approval)"
+                },
+                "approved": {
+                    "type": "boolean",
+                    "description": "Set true after user explicitly approves reading restricted paths",
+                    "default": false
                 }
             },
             "required": ["path"]
@@ -44,16 +49,31 @@ impl Tool for FileReadTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'path' parameter"))?;
 
+        let approved = args
+            .get("approved")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         // Security check: validate path is within workspace
-        if !self.security.is_path_allowed(path) {
+        let path_allowed = self.security.is_path_allowed(path);
+        if !path_allowed && !approved {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Path not allowed by security policy: {path}")),
+                error: Some(format!(
+                    "APPROVAL_REQUIRED: Path `{path}` is outside the allowed workspace. \
+                     Ask the user for explicit approval before proceeding."
+                )),
             });
         }
 
-        let full_path = self.security.workspace_dir.join(path);
+        // Determine full path: approved absolute paths are used directly,
+        // otherwise resolve relative to workspace.
+        let full_path = if approved && std::path::Path::new(path).is_absolute() {
+            std::path::PathBuf::from(path)
+        } else {
+            self.security.workspace_dir.join(path)
+        };
 
         // Resolve path before reading to block symlink escapes.
         let resolved_path = match tokio::fs::canonicalize(&full_path).await {
@@ -67,7 +87,8 @@ impl Tool for FileReadTool {
             }
         };
 
-        if !self.security.is_resolved_path_allowed(&resolved_path) {
+        // Workspace containment check (skip when user-approved)
+        if !approved && !self.security.is_resolved_path_allowed(&resolved_path) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -126,6 +147,7 @@ mod tests {
         Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: workspace,
+            workspace_only: true,
             ..SecurityPolicy::default()
         })
     }
@@ -191,17 +213,17 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("not allowed"));
+        assert!(result.error.as_ref().unwrap().contains("APPROVAL_REQUIRED"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[tokio::test]
-    async fn file_read_blocks_absolute_path() {
+    async fn file_read_blocks_absolute_path_without_approval() {
         let tool = FileReadTool::new(test_security(std::env::temp_dir()));
         let result = tool.execute(json!({"path": "/etc/passwd"})).await.unwrap();
         assert!(!result.success);
-        assert!(result.error.as_ref().unwrap().contains("not allowed"));
+        assert!(result.error.as_ref().unwrap().contains("APPROVAL_REQUIRED"));
     }
 
     #[tokio::test]

@@ -372,45 +372,51 @@ impl Default for AutonomyConfig {
     fn default() -> Self {
         Self {
             level: AutonomyLevel::Supervised,
-            workspace_only: true,
+            workspace_only: false,
             allowed_commands: vec![
-                "git".into(),
-                "npm".into(),
-                "cargo".into(),
-                "ls".into(),
-                "cat".into(),
-                "grep".into(),
-                "find".into(),
-                "echo".into(),
-                "pwd".into(),
-                "wc".into(),
-                "head".into(),
-                "tail".into(),
+                // Core shell
+                "ls".into(), "cat".into(), "grep".into(), "find".into(),
+                "echo".into(), "pwd".into(), "wc".into(), "head".into(),
+                "tail".into(), "sort".into(), "uniq".into(), "tr".into(),
+                "cut".into(), "awk".into(), "sed".into(), "tee".into(),
+                "xargs".into(), "env".into(), "which".into(), "file".into(),
+                "stat".into(), "date".into(), "whoami".into(), "hostname".into(),
+                "uname".into(), "df".into(), "du".into(), "ps".into(),
+                "top".into(), "lsof".into(), "killall".into(),
+                // File operations
+                "mkdir".into(), "touch".into(), "cp".into(), "mv".into(),
+                "rm".into(), "ln".into(), "chmod".into(), "chown".into(),
+                "tar".into(), "zip".into(), "unzip".into(), "gzip".into(),
+                "gunzip".into(), "trash".into(),
+                // Dev tools
+                "git".into(), "cargo".into(), "rustc".into(), "rustup".into(),
+                "npm".into(), "npx".into(), "node".into(), "yarn".into(),
+                "pnpm".into(), "bun".into(), "deno".into(),
+                "python3".into(), "python".into(), "pip3".into(), "pip".into(),
+                "go".into(), "make".into(), "cmake".into(), "gcc".into(),
+                // Package managers
+                "brew".into(), "apt".into(), "apt-get".into(), "dnf".into(),
+                // Network
+                "curl".into(), "wget".into(), "ssh".into(), "scp".into(),
+                "rsync".into(), "ping".into(), "dig".into(), "nslookup".into(),
+                // System
+                "sudo".into(), "launchctl".into(), "open".into(),
+                "defaults".into(), "diskutil".into(), "softwareupdate".into(),
+                "pmset".into(), "networksetup".into(), "scutil".into(),
+                // Containers
+                "docker".into(), "docker-compose".into(), "podman".into(),
+                "kubectl".into(), "helm".into(), "terraform".into(),
             ],
             forbidden_paths: vec![
-                "/etc".into(),
-                "/root".into(),
-                "/home".into(),
-                "/usr".into(),
-                "/bin".into(),
-                "/sbin".into(),
-                "/lib".into(),
-                "/opt".into(),
                 "/boot".into(),
                 "/dev".into(),
                 "/proc".into(),
                 "/sys".into(),
-                "/var".into(),
-                "/tmp".into(),
-                "~/.ssh".into(),
-                "~/.gnupg".into(),
-                "~/.aws".into(),
-                "~/.config".into(),
             ],
-            max_actions_per_hour: 20,
+            max_actions_per_hour: 100,
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
-            block_high_risk_commands: true,
+            block_high_risk_commands: false,
         }
     }
 }
@@ -1037,14 +1043,17 @@ mod tests {
     fn autonomy_config_default() {
         let a = AutonomyConfig::default();
         assert_eq!(a.level, AutonomyLevel::Supervised);
-        assert!(a.workspace_only);
+        assert!(!a.workspace_only);
         assert!(a.allowed_commands.contains(&"git".to_string()));
         assert!(a.allowed_commands.contains(&"cargo".to_string()));
-        assert!(a.forbidden_paths.contains(&"/etc".to_string()));
-        assert_eq!(a.max_actions_per_hour, 20);
+        assert!(a.allowed_commands.contains(&"rm".to_string()));
+        assert!(a.allowed_commands.contains(&"sudo".to_string()));
+        assert!(a.forbidden_paths.contains(&"/boot".to_string()));
+        assert!(a.forbidden_paths.contains(&"/proc".to_string()));
+        assert_eq!(a.max_actions_per_hour, 100);
         assert_eq!(a.max_cost_per_day_cents, 500);
         assert!(a.require_approval_for_medium_risk);
-        assert!(a.block_high_risk_commands);
+        assert!(!a.block_high_risk_commands);
     }
 
     #[test]
@@ -1643,18 +1652,22 @@ default_temperature = 0.7
     #[test]
     fn checklist_autonomy_default_is_workspace_scoped() {
         let a = AutonomyConfig::default();
-        assert!(a.workspace_only, "Default autonomy must be workspace_only");
+        assert!(!a.workspace_only, "Default autonomy workspace_only is now false");
         assert!(
-            a.forbidden_paths.contains(&"/etc".to_string()),
-            "Must block /etc"
+            a.forbidden_paths.contains(&"/boot".to_string()),
+            "Must block /boot"
         );
         assert!(
             a.forbidden_paths.contains(&"/proc".to_string()),
             "Must block /proc"
         );
         assert!(
-            a.forbidden_paths.contains(&"~/.ssh".to_string()),
-            "Must block ~/.ssh"
+            a.forbidden_paths.contains(&"/sys".to_string()),
+            "Must block /sys"
+        );
+        assert!(
+            a.forbidden_paths.contains(&"/dev".to_string()),
+            "Must block /dev"
         );
     }
 
