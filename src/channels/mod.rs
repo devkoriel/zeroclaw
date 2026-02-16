@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod discord;
 pub mod email_channel;
+pub mod formatting;
 pub mod imessage;
 pub mod irc;
 pub mod matrix;

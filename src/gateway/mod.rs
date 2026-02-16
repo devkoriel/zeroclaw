@@ -7,7 +7,9 @@
 //! - Request timeouts (30s) to prevent slow-loris attacks
 //! - Header sanitization (handled by axum/hyper)
 
-use crate::agent::loop_::{agent_turn, build_context, build_tool_instructions, trim_history};
+use crate::agent::loop_::{
+    agent_turn, build_context, build_tool_instructions, trim_history, trim_history_by_size,
+};
 use crate::channels::{build_system_prompt, Channel, WhatsAppChannel};
 use crate::config::Config;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -272,7 +274,16 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     match mem.load_all_conversations().await {
         Ok(stored) => {
             for (sender_id, history_json) in stored {
-                if let Ok(history) = serde_json::from_str::<Vec<ChatMessage>>(&history_json) {
+                if let Ok(mut history) = serde_json::from_str::<Vec<ChatMessage>>(&history_json)
+                {
+                    // Replace stale system prompt with current one
+                    if history.first().map_or(false, |m| m.role == "system") {
+                        history[0] =
+                            ChatMessage::system(system_prompt.as_ref());
+                    }
+                    // Trim restored conversations to prevent "prompt too long" on first request
+                    trim_history(&mut history);
+                    trim_history_by_size(&mut history);
                     conversations.insert(sender_id, history);
                 }
             }
@@ -644,6 +655,7 @@ async fn handle_webhook(
     {
         Ok(response) => {
             trim_history(&mut history);
+            trim_history_by_size(&mut history);
             let subject = crate::agent::routing::extract_subject(&history);
             let history_json = serde_json::to_string(&history).unwrap_or_default();
             state
@@ -660,7 +672,30 @@ async fn handle_webhook(
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
+            let err_str = e.to_string();
+            tracing::error!(
+                "Webhook agent error: {}",
+                providers::sanitize_api_error(&err_str)
+            );
+
+            // Build user-friendly fallback instead of opaque 500.
+            let user_msg = if err_str.contains("prompt is too long")
+                || err_str.contains("too many tokens")
+                || err_str.contains("context_length_exceeded")
+            {
+                // Conversation too long — reset history for this sender
+                // so the next message starts fresh.
+                history.truncate(1); // keep system prompt only
+                "Our conversation got too long and I lost context. I've reset the thread — please resend your last message."
+                    .to_string()
+            } else if err_str.contains("All providers failed") {
+                "All AI providers are temporarily unavailable. Please try again in a minute.".to_string()
+            } else {
+                "Something went wrong processing your request. Please try again.".to_string()
+            };
+
             trim_history(&mut history);
+            trim_history_by_size(&mut history);
             let subject = crate::agent::routing::extract_subject(&history);
             let history_json = serde_json::to_string(&history).unwrap_or_default();
             state
@@ -670,12 +705,14 @@ async fn handle_webhook(
                 .mem
                 .save_conversation(&sender_id, &history_json, subject.as_deref())
                 .await;
-            tracing::error!(
-                "Webhook agent error: {}",
-                providers::sanitize_api_error(&e.to_string())
-            );
-            let err = serde_json::json!({"error": "Agent processing failed"});
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+
+            // Return 200 with user-facing message so channels relay it
+            // instead of showing "Error: HTTP 500".
+            let body = serde_json::json!({
+                "response": user_msg,
+                "model": selected_model,
+            });
+            (StatusCode::OK, Json(body))
         }
     }
 }

@@ -15,7 +15,9 @@ use std::time::Instant;
 use uuid::Uuid;
 
 /// Maximum agentic tool-use iterations per user message to prevent runaway loops.
-pub const MAX_TOOL_ITERATIONS: usize = 10;
+/// GUI automation tasks (screenshot→analyze→click→verify) typically need ~5 iterations
+/// per action, so this must be high enough for multi-step workflows.
+pub const MAX_TOOL_ITERATIONS: usize = 25;
 
 /// Trigger auto-compaction when non-system message count exceeds this threshold.
 /// When exceeded, the oldest messages are dropped (system prompt is always preserved).
@@ -52,6 +54,31 @@ pub fn trim_history(history: &mut Vec<ChatMessage>) {
     let start = if has_system { 1 } else { 0 };
     let to_remove = non_system_count - MAX_HISTORY_MESSAGES;
     history.drain(start..start + to_remove);
+}
+
+/// Character-budget trim: drop oldest non-system messages until total content
+/// size fits within a safe limit (~100K chars ≈ ~25K tokens).
+/// This catches cases where message count is within bounds but individual
+/// messages contain huge payloads (e.g. screenshot descriptions, shell output).
+const MAX_HISTORY_CHARS: usize = 100_000;
+
+pub fn trim_history_by_size(history: &mut Vec<ChatMessage>) {
+    let total: usize = history.iter().map(|m| m.content.len()).sum();
+    if total <= MAX_HISTORY_CHARS {
+        return;
+    }
+
+    let has_system = history.first().map_or(false, |m| m.role == "system");
+    let start = if has_system { 1 } else { 0 };
+
+    // Drop oldest non-system messages until under budget (keep at least 4 recent)
+    while history.len() > start + 4 {
+        let total: usize = history.iter().map(|m| m.content.len()).sum();
+        if total <= MAX_HISTORY_CHARS {
+            break;
+        }
+        history.remove(start);
+    }
 }
 
 fn build_compaction_transcript(messages: &[ChatMessage]) -> String {
@@ -355,7 +382,13 @@ pub async fn agent_turn(
     // user-approved retries to pass through.
     let mut denied_tools: HashSet<String> = HashSet::new();
 
+    let mut last_text = String::new();
+
     for _iteration in 0..MAX_TOOL_ITERATIONS {
+        // Mid-turn trim: prevent "prompt is too long" as tool results accumulate.
+        trim_history(history);
+        trim_history_by_size(history);
+
         let response = provider
             .chat_with_history(history, model, temperature)
             .await?;
@@ -368,8 +401,9 @@ pub async fn agent_turn(
             return Ok(if text.is_empty() { response } else { text });
         }
 
-        // Print any text the LLM produced alongside tool calls
+        // Track last text for graceful fallback if iterations are exhausted
         if !text.is_empty() {
+            last_text = text.clone();
             print!("{text}");
             let _ = std::io::stdout().flush();
         }
@@ -442,7 +476,13 @@ pub async fn agent_turn(
         history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
     }
 
-    anyhow::bail!("Agent exceeded maximum tool iterations ({MAX_TOOL_ITERATIONS})")
+    // Exhausted iterations — return partial text instead of hard failure
+    tracing::warn!("Agent reached max tool iterations ({MAX_TOOL_ITERATIONS})");
+    if last_text.is_empty() {
+        Ok("I ran out of steps while working on that task. The work is partially done — please try a simpler request or break it into smaller steps.".to_string())
+    } else {
+        Ok(format!("{last_text}\n\n(Note: I reached the tool-use limit and couldn't finish all steps. You may need to continue from here.)"))
+    }
 }
 
 /// Build the tool instruction block for the system prompt so the LLM knows

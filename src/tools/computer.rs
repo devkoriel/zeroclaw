@@ -88,7 +88,28 @@ impl ComputerTool {
         let path = format!("/tmp/zeroclaw_screen_{ts}.jpg");
 
         if let Err(e) = run_cmd("screencapture", &["-x", "-t", "jpg", &path]).await {
-            return err_result(format!("Screenshot capture failed: {e}"));
+            return err_result(format!(
+                "Screenshot capture failed: {e}\n\n\
+                 If Screen Recording permission is needed:\n\
+                 1. Open: System Settings → Privacy & Security → Screen Recording\n\
+                 2. Click + and add /Applications/ZeroClaw.app\n\
+                 3. Toggle it ON, then restart the daemon"
+            ));
+        }
+
+        // Check if screenshot file is empty (permission denied produces 0-byte file)
+        if let Ok(meta) = tokio::fs::metadata(&path).await {
+            if meta.len() == 0 {
+                let _ = tokio::fs::remove_file(&path).await;
+                return err_result(
+                    "Screen Recording permission required — screenshot file is empty.\n\n\
+                     Grant it now:\n\
+                     1. Open: System Settings → Privacy & Security → Screen Recording\n\
+                     2. Click + and add /Applications/ZeroClaw.app\n\
+                     3. Toggle it ON\n\
+                     4. Restart the daemon: launchctl kickstart -k gui/501/com.zeroclaw.daemon"
+                );
+            }
         }
 
         // 2. Get logical screen width and resize
@@ -526,16 +547,35 @@ async fn run_cmd(program: &str, args: &[&str]) -> Result<String, String> {
     }
 }
 
-/// Check if cliclick is installed. Returns Err with install instructions if missing.
+/// Check if cliclick is installed and Accessibility is granted.
 async fn check_cliclick() -> Result<(), String> {
-    match run_cmd("which", &["cliclick"]).await {
+    if run_cmd("which", &["cliclick"]).await.is_err() {
+        return Err(
+            "cliclick not found. Install with: brew install cliclick".into(),
+        );
+    }
+
+    // Quick accessibility check: try a no-op cursor position query.
+    // cliclick prints an error and exits non-zero without Accessibility.
+    match run_cmd("cliclick", &["p"]).await {
         Ok(_) => Ok(()),
-        Err(_) => Err(
-            "cliclick not found. Install with: brew install cliclick\n\
-             Then grant Accessibility access in System Preferences > \
-             Privacy & Security > Accessibility."
-                .into(),
-        ),
+        Err(e) => {
+            let msg = e.to_lowercase();
+            if msg.contains("accessibility") || msg.contains("permission") || msg.contains("not allowed") {
+                Err(
+                    "Accessibility permission required for mouse/keyboard control.\n\n\
+                     Grant it now:\n\
+                     1. Open: System Settings → Privacy & Security → Accessibility\n\
+                     2. Click + and add /Applications/ZeroClaw.app\n\
+                     3. Toggle it ON\n\n\
+                     Then try again."
+                        .into(),
+                )
+            } else {
+                // Some other cliclick error
+                Err(format!("cliclick check failed: {e}"))
+            }
+        }
     }
 }
 

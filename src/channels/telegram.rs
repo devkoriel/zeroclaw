@@ -370,28 +370,29 @@ impl Channel for TelegramChannel {
     }
 
     async fn send(&self, message: &str, chat_id: &str) -> anyhow::Result<()> {
-        let markdown_body = serde_json::json!({
+        let html_text = super::formatting::markdown_to_telegram_html(message);
+        let html_body = serde_json::json!({
             "chat_id": chat_id,
-            "text": message,
-            "parse_mode": "Markdown"
+            "text": html_text,
+            "parse_mode": "HTML"
         });
 
-        let markdown_resp = self
+        let html_resp = self
             .client
             .post(self.api_url("sendMessage"))
-            .json(&markdown_body)
+            .json(&html_body)
             .send()
             .await?;
 
-        if markdown_resp.status().is_success() {
+        if html_resp.status().is_success() {
             return Ok(());
         }
 
-        let markdown_status = markdown_resp.status();
-        let markdown_err = markdown_resp.text().await.unwrap_or_default();
+        let html_status = html_resp.status();
+        let html_err = html_resp.text().await.unwrap_or_default();
         tracing::warn!(
-            status = ?markdown_status,
-            "Telegram sendMessage with Markdown failed; retrying without parse_mode"
+            status = ?html_status,
+            "Telegram sendMessage with HTML failed; retrying without parse_mode"
         );
 
         // Retry without parse_mode as a compatibility fallback.
@@ -410,9 +411,9 @@ impl Channel for TelegramChannel {
             let plain_status = plain_resp.status();
             let plain_err = plain_resp.text().await.unwrap_or_default();
             anyhow::bail!(
-                "Telegram sendMessage failed (markdown {}: {}; plain {}: {})",
-                markdown_status,
-                markdown_err,
+                "Telegram sendMessage failed (html {}: {}; plain {}: {})",
+                html_status,
+                html_err,
                 plain_status,
                 plain_err
             );

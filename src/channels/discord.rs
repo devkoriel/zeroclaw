@@ -141,7 +141,8 @@ impl Channel for DiscordChannel {
     }
 
     async fn send(&self, message: &str, channel_id: &str) -> anyhow::Result<()> {
-        let chunks = split_message_for_discord(message);
+        let formatted = super::formatting::markdown_to_discord(message);
+        let chunks = split_message_for_discord(&formatted);
 
         for (i, chunk) in chunks.iter().enumerate() {
             let url = format!("https://discord.com/api/v10/channels/{channel_id}/messages");
