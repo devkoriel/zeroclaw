@@ -809,9 +809,9 @@ impl Tool for ComputerTool {
     }
 
     fn description(&self) -> &str {
-        "See the screen and control mouse/keyboard to interact with any macOS application. \
-         Actions: screenshot (see screen via AI vision), click/double_click/right_click, \
-         type, key (combos like cmd+c), scroll, open_app, cursor_position."
+        "Your eyes and hands. See the screen and control mouse/keyboard on any macOS application. \
+         screenshot auto-probes via Swift AXAPI first (fast, precise coordinates), falls back to Vision AI only if needed. \
+         Actions: screenshot, click/double_click/right_click, type, key (combos like cmd+c), scroll, open_app, cursor_position."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
