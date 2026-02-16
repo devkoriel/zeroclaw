@@ -264,6 +264,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &tool_descs,
         &loaded_skills,
         Some(&config.identity),
+        &config.model_routes,
     );
     system_prompt_str.push_str(&build_tool_instructions(&tools_registry));
     let system_prompt: Arc<str> = Arc::from(system_prompt_str);
@@ -634,13 +635,23 @@ async fn handle_webhook(
         .value()
         .clone();
 
-    // Enrich message with memory context
-    let context = build_context(state.mem.as_ref(), message).await;
-    let enriched = if context.is_empty() {
-        message.clone()
+    // Detect channel from sender_id prefix (e.g. "telegram_123", "discord_456")
+    let channel = if sender_id.starts_with("telegram_") {
+        Some("telegram")
+    } else if sender_id.starts_with("discord_") {
+        Some("discord")
     } else {
-        format!("{context}{message}")
+        None
     };
+
+    // Enrich message with memory context + channel awareness
+    let context = build_context(state.mem.as_ref(), message).await;
+    let channel_hint = match channel {
+        Some("telegram") => "[Platform: Telegram] The user is chatting with you via Telegram. You ARE the Telegram bot — never suggest \"sending via Telegram\" or ask for bot tokens. Use standard Markdown in your response; the system converts it to Telegram HTML automatically.\n\n",
+        Some("discord") => "[Platform: Discord] The user is chatting with you via Discord. You ARE the Discord bot.\n\n",
+        _ => "",
+    };
+    let enriched = format!("{channel_hint}{context}{message}");
     history.push(ChatMessage::user(&enriched));
 
     match agent_turn(
@@ -665,9 +676,24 @@ async fn handle_webhook(
                 .mem
                 .save_conversation(&sender_id, &history_json, subject.as_deref())
                 .await;
+
+            // Channel-specific formatting applied at the gateway so the relay
+            // receives pre-formatted text and doesn't need its own converter.
+            let formatted_response = match channel {
+                Some("telegram") => {
+                    crate::channels::formatting::markdown_to_telegram_html(&response)
+                }
+                Some("discord") => {
+                    crate::channels::formatting::markdown_to_discord(&response)
+                }
+                _ => response.clone(),
+            };
+
             let body = serde_json::json!({
-                "response": response,
+                "response": formatted_response,
+                "response_raw": response,
                 "model": selected_model,
+                "format": channel.unwrap_or("plain"),
             });
             (StatusCode::OK, Json(body))
         }

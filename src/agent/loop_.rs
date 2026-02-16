@@ -639,6 +639,7 @@ pub async fn run(
         &tool_descs,
         &skills,
         Some(&config.identity),
+        &config.model_routes,
     );
 
     // Append structured tool-use instructions with schemas
