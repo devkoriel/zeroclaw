@@ -7,6 +7,7 @@ pub mod file_read;
 pub mod file_write;
 pub mod http_request;
 pub mod image_info;
+pub mod kakaotalk;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
@@ -24,6 +25,7 @@ pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
+pub use kakaotalk::KakaoTalkTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
@@ -137,6 +139,9 @@ pub fn all_tools_with_runtime(
         .filter(|k| !k.trim().is_empty());
     tools.push(Box::new(ComputerTool::new(security.clone(), gemini_key)));
 
+    // KakaoTalk messaging tool (native AppleScript, no vision AI needed)
+    tools.push(Box::new(KakaoTalkTool::new(security.clone())));
+
     if let Some(key) = composio_key {
         if !key.is_empty() {
             tools.push(Box::new(ComposioTool::new(key)));
@@ -191,6 +196,10 @@ mod tests {
         assert!(
             names.contains(&"computer"),
             "computer tool missing from registry. Found: {names:?}"
+        );
+        assert!(
+            names.contains(&"kakaotalk"),
+            "kakaotalk tool missing from registry. Found: {names:?}"
         );
     }
 
