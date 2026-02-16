@@ -364,15 +364,18 @@ impl Tool for SelfUpgradeTool {
              I'll send another notification when I'm back."
         ));
 
-        // Phase 5: Schedule restart via a DETACHED process that outlives this daemon.
+        // Phase 5: Restart via launchctl kickstart -k (atomic kill+restart).
+        // Previous approach (bootout + sleep + bootstrap) failed because bootout
+        // kills the entire service process group, including the nohup child that
+        // was supposed to run bootstrap. kickstart -k is a single launchd IPC
+        // message: launchd kills the service and immediately re-launches it.
         let uid = Command::new("id").arg("-u").output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
             .unwrap_or_else(|_| "501".into());
-        let plist = format!("{home}/Library/LaunchAgents/com.zeroclaw.daemon.plist");
 
+        let service_target = format!("gui/{uid}/com.zeroclaw.daemon");
         let restart_script = format!(
-            "sleep 5; launchctl bootout gui/{uid} '{plist}' 2>/dev/null; \
-             sleep 2; launchctl bootstrap gui/{uid} '{plist}'"
+            "sleep 5; launchctl kickstart -kp '{service_target}'"
         );
         let _ = Command::new("nohup")
             .args(["bash", "-c", &restart_script])
