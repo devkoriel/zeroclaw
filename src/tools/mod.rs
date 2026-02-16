@@ -5,6 +5,10 @@ pub mod computer;
 pub mod delegate;
 pub mod file_read;
 pub mod file_write;
+pub mod git_operations;
+pub mod hardware_board_info;
+pub mod hardware_memory_map;
+pub mod hardware_memory_read;
 pub mod http_request;
 pub mod image_info;
 pub mod memory_forget;
@@ -12,23 +16,30 @@ pub mod memory_recall;
 pub mod memory_store;
 // --- ZeroClaw fork: Hybrid Programmatic Grounding ---
 pub mod screen_state;
+// --- upstream addition ---
+pub mod schedule;
 pub mod screenshot;
 pub mod self_upgrade;
 pub mod shell;
 pub mod traits;
 
-pub use browser::BrowserTool;
+pub use browser::{BrowserTool, ComputerUseConfig};
 pub use browser_open::BrowserOpenTool;
 pub use composio::ComposioTool;
 pub use computer::ComputerTool;
 pub use delegate::DelegateTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
+pub use git_operations::GitOperationsTool;
+pub use hardware_board_info::HardwareBoardInfoTool;
+pub use hardware_memory_map::HardwareMemoryMapTool;
+pub use hardware_memory_read::HardwareMemoryReadTool;
 pub use http_request::HttpRequestTool;
 pub use image_info::ImageInfoTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
+pub use schedule::ScheduleTool;
 pub use screenshot::ScreenshotTool;
 pub use self_upgrade::SelfUpgradeTool;
 pub use shell::ShellTool;
@@ -61,37 +72,48 @@ pub fn default_tools_with_runtime(
 }
 
 /// Create full tool registry including memory tools and optional Composio
+#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
 pub fn all_tools(
     security: &Arc<SecurityPolicy>,
     memory: Arc<dyn Memory>,
     composio_key: Option<&str>,
+    composio_entity_id: Option<&str>,
     browser_config: &crate::config::BrowserConfig,
     http_config: &crate::config::HttpRequestConfig,
+    workspace_dir: &std::path::Path,
     agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
+    config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
     all_tools_with_runtime(
         security,
         Arc::new(NativeRuntime::new()),
         memory,
         composio_key,
+        composio_entity_id,
         browser_config,
         http_config,
+        workspace_dir,
         agents,
         fallback_api_key,
+        config,
     )
 }
 
 /// Create full tool registry including memory tools and optional Composio.
+#[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
 pub fn all_tools_with_runtime(
     security: &Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
     memory: Arc<dyn Memory>,
     composio_key: Option<&str>,
+    composio_entity_id: Option<&str>,
     browser_config: &crate::config::BrowserConfig,
     http_config: &crate::config::HttpRequestConfig,
+    workspace_dir: &std::path::Path,
     agents: &HashMap<String, DelegateAgentConfig>,
     fallback_api_key: Option<&str>,
+    config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = vec![
         Box::new(ShellTool::new(security.clone(), runtime)),
@@ -100,6 +122,11 @@ pub fn all_tools_with_runtime(
         Box::new(MemoryStoreTool::new(memory.clone())),
         Box::new(MemoryRecallTool::new(memory.clone())),
         Box::new(MemoryForgetTool::new(memory)),
+        Box::new(ScheduleTool::new(security.clone(), config.clone())),
+        Box::new(GitOperationsTool::new(
+            security.clone(),
+            workspace_dir.to_path_buf(),
+        )),
     ];
 
     if browser_config.enabled {
@@ -108,11 +135,24 @@ pub fn all_tools_with_runtime(
             security.clone(),
             browser_config.allowed_domains.clone(),
         )));
-        // Add full browser automation tool (agent-browser)
-        tools.push(Box::new(BrowserTool::new(
+        // Add full browser automation tool (pluggable backend)
+        tools.push(Box::new(BrowserTool::new_with_backend(
             security.clone(),
             browser_config.allowed_domains.clone(),
             browser_config.session_name.clone(),
+            browser_config.backend.clone(),
+            browser_config.native_headless,
+            browser_config.native_webdriver_url.clone(),
+            browser_config.native_chrome_path.clone(),
+            ComputerUseConfig {
+                endpoint: browser_config.computer_use.endpoint.clone(),
+                api_key: browser_config.computer_use.api_key.clone(),
+                timeout_ms: browser_config.computer_use.timeout_ms,
+                allow_remote_endpoint: browser_config.computer_use.allow_remote_endpoint,
+                window_allowlist: browser_config.computer_use.window_allowlist.clone(),
+                max_coordinate_x: browser_config.computer_use.max_coordinate_x,
+                max_coordinate_y: browser_config.computer_use.max_coordinate_y,
+            },
         )));
     }
 
@@ -141,14 +181,18 @@ pub fn all_tools_with_runtime(
 
     if let Some(key) = composio_key {
         if !key.is_empty() {
-            tools.push(Box::new(ComposioTool::new(key)));
+            tools.push(Box::new(ComposioTool::new(key, composio_entity_id)));
         }
     }
 
     // Add delegation tool when agents are configured
     if !agents.is_empty() {
+        let delegate_agents: HashMap<String, DelegateAgentConfig> = agents
+            .iter()
+            .map(|(name, cfg)| (name.clone(), cfg.clone()))
+            .collect();
         tools.push(Box::new(DelegateTool::new(
-            agents.clone(),
+            delegate_agents,
             fallback_api_key.map(String::from),
         )));
     }
@@ -159,8 +203,16 @@ pub fn all_tools_with_runtime(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{BrowserConfig, MemoryConfig};
+    use crate::config::{BrowserConfig, Config, MemoryConfig};
     use tempfile::TempDir;
+
+    fn test_config(tmp: &TempDir) -> Config {
+        Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        }
+    }
 
     #[test]
     fn default_tools_has_three() {
@@ -184,16 +236,30 @@ mod tests {
             enabled: false,
             allowed_domains: vec!["example.com".into()],
             session_name: None,
+            ..BrowserConfig::default()
         };
         let http = crate::config::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
 
-        let tools = all_tools(&security, mem, None, &browser, &http, &HashMap::new(), None);
+        let tools = all_tools(
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+        );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
         assert!(
             names.contains(&"computer"),
             "computer tool missing from registry. Found: {names:?}"
         );
+        assert!(names.contains(&"schedule"));
     }
 
     #[test]
@@ -211,10 +277,23 @@ mod tests {
             enabled: true,
             allowed_domains: vec!["example.com".into()],
             session_name: None,
+            ..BrowserConfig::default()
         };
         let http = crate::config::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
 
-        let tools = all_tools(&security, mem, None, &browser, &http, &HashMap::new(), None);
+        let tools = all_tools(
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+        );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"browser_open"));
     }
@@ -330,6 +409,7 @@ mod tests {
 
         let browser = BrowserConfig::default();
         let http = crate::config::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
 
         let mut agents = HashMap::new();
         agents.insert(
@@ -348,10 +428,13 @@ mod tests {
             &security,
             mem,
             None,
+            None,
             &browser,
             &http,
+            tmp.path(),
             &agents,
             Some("sk-test"),
+            &cfg,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(names.contains(&"delegate"));
@@ -370,8 +453,20 @@ mod tests {
 
         let browser = BrowserConfig::default();
         let http = crate::config::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
 
-        let tools = all_tools(&security, mem, None, &browser, &http, &HashMap::new(), None);
+        let tools = all_tools(
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+        );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"delegate"));
     }

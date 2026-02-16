@@ -76,26 +76,35 @@ impl HttpRequestTool {
         }
     }
 
-    fn sanitize_headers(&self, headers: &serde_json::Value) -> Vec<(String, String)> {
+    fn parse_headers(&self, headers: &serde_json::Value) -> Vec<(String, String)> {
         let mut result = Vec::new();
         if let Some(obj) = headers.as_object() {
             for (key, value) in obj {
                 if let Some(str_val) = value.as_str() {
-                    // Redact sensitive headers from logs (we don't log headers, but this is defense-in-depth)
-                    let is_sensitive = key.to_lowercase().contains("authorization")
-                        || key.to_lowercase().contains("api-key")
-                        || key.to_lowercase().contains("apikey")
-                        || key.to_lowercase().contains("token")
-                        || key.to_lowercase().contains("secret");
-                    if is_sensitive {
-                        result.push((key.clone(), "***REDACTED***".into()));
-                    } else {
-                        result.push((key.clone(), str_val.to_string()));
-                    }
+                    result.push((key.clone(), str_val.to_string()));
                 }
             }
         }
         result
+    }
+
+    fn redact_headers_for_display(headers: &[(String, String)]) -> Vec<(String, String)> {
+        headers
+            .iter()
+            .map(|(key, value)| {
+                let lower = key.to_lowercase();
+                let is_sensitive = lower.contains("authorization")
+                    || lower.contains("api-key")
+                    || lower.contains("apikey")
+                    || lower.contains("token")
+                    || lower.contains("secret");
+                if is_sensitive {
+                    (key.clone(), "***REDACTED***".into())
+                } else {
+                    (key.clone(), value.clone())
+                }
+            })
+            .collect()
     }
 
     async fn execute_request(
@@ -230,10 +239,10 @@ impl Tool for HttpRequestTool {
             }
         };
 
-        let sanitized_headers = self.sanitize_headers(&headers_val);
+        let request_headers = self.parse_headers(&headers_val);
 
         match self
-            .execute_request(&url, method, sanitized_headers, body)
+            .execute_request(&url, method, request_headers, body)
             .await
         {
             Ok(response) => {
@@ -380,39 +389,58 @@ fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
 }
 
 fn is_private_or_local_host(host: &str) -> bool {
-    let has_local_tld = host
+    // Strip brackets from IPv6 addresses like [::1]
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+
+    let has_local_tld = bare
         .rsplit('.')
         .next()
         .is_some_and(|label| label == "local");
 
-    if host == "localhost" || host.ends_with(".localhost") || has_local_tld || host == "::1" {
+    if bare == "localhost" || bare.ends_with(".localhost") || has_local_tld {
         return true;
     }
 
-    if let Some([a, b, _, _]) = parse_ipv4(host) {
-        return a == 0
-            || a == 10
-            || a == 127
-            || (a == 169 && b == 254)
-            || (a == 172 && (16..=31).contains(&b))
-            || (a == 192 && b == 168)
-            || (a == 100 && (64..=127).contains(&b));
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => is_non_global_v4(v4),
+            std::net::IpAddr::V6(v6) => is_non_global_v6(v6),
+        };
     }
 
     false
 }
 
-fn parse_ipv4(host: &str) -> Option<[u8; 4]> {
-    let parts: Vec<&str> = host.split('.').collect();
-    if parts.len() != 4 {
-        return None;
-    }
+/// Returns true if the IPv4 address is not globally routable.
+fn is_non_global_v4(v4: std::net::Ipv4Addr) -> bool {
+    let [a, b, c, _] = v4.octets();
+    v4.is_loopback()                       // 127.0.0.0/8
+        || v4.is_private()                 // 10/8, 172.16/12, 192.168/16
+        || v4.is_link_local()              // 169.254.0.0/16
+        || v4.is_unspecified()             // 0.0.0.0
+        || v4.is_broadcast()              // 255.255.255.255
+        || v4.is_multicast()              // 224.0.0.0/4
+        || (a == 100 && (64..=127).contains(&b)) // Shared address space (RFC 6598)
+        || a >= 240                        // Reserved (240.0.0.0/4, except broadcast)
+        || (a == 192 && b == 0 && (c == 0 || c == 2)) // IETF assignments + TEST-NET-1
+        || (a == 198 && b == 51)           // Documentation (198.51.100.0/24)
+        || (a == 203 && b == 0)            // Documentation (203.0.113.0/24)
+        || (a == 198 && (18..=19).contains(&b)) // Benchmarking (198.18.0.0/15)
+}
 
-    let mut octets = [0_u8; 4];
-    for (i, part) in parts.iter().enumerate() {
-        octets[i] = part.parse::<u8>().ok()?;
-    }
-    Some(octets)
+/// Returns true if the IPv6 address is not globally routable.
+fn is_non_global_v6(v6: std::net::Ipv6Addr) -> bool {
+    let segs = v6.segments();
+    v6.is_loopback()                       // ::1
+        || v6.is_unspecified()             // ::
+        || v6.is_multicast()              // ff00::/8
+        || (segs[0] & 0xfe00) == 0xfc00   // Unique-local (fc00::/7)
+        || (segs[0] & 0xffc0) == 0xfe80   // Link-local (fe80::/10)
+        || (segs[0] == 0x2001 && segs[1] == 0x0db8) // Documentation (2001:db8::/32)
+        || v6.to_ipv4_mapped().is_some_and(|v4| is_non_global_v4(v4))
 }
 
 #[cfg(test)]
@@ -549,15 +577,86 @@ mod tests {
     }
 
     #[test]
-    fn parse_ipv4_valid() {
-        assert_eq!(parse_ipv4("1.2.3.4"), Some([1, 2, 3, 4]));
+    fn blocks_multicast_ipv4() {
+        assert!(is_private_or_local_host("224.0.0.1"));
+        assert!(is_private_or_local_host("239.255.255.255"));
     }
 
     #[test]
-    fn parse_ipv4_invalid() {
-        assert_eq!(parse_ipv4("1.2.3"), None);
-        assert_eq!(parse_ipv4("1.2.3.999"), None);
-        assert_eq!(parse_ipv4("not-an-ip"), None);
+    fn blocks_broadcast() {
+        assert!(is_private_or_local_host("255.255.255.255"));
+    }
+
+    #[test]
+    fn blocks_reserved_ipv4() {
+        assert!(is_private_or_local_host("240.0.0.1"));
+        assert!(is_private_or_local_host("250.1.2.3"));
+    }
+
+    #[test]
+    fn blocks_documentation_ranges() {
+        assert!(is_private_or_local_host("192.0.2.1")); // TEST-NET-1
+        assert!(is_private_or_local_host("198.51.100.1")); // TEST-NET-2
+        assert!(is_private_or_local_host("203.0.113.1")); // TEST-NET-3
+    }
+
+    #[test]
+    fn blocks_benchmarking_range() {
+        assert!(is_private_or_local_host("198.18.0.1"));
+        assert!(is_private_or_local_host("198.19.255.255"));
+    }
+
+    #[test]
+    fn blocks_ipv6_localhost() {
+        assert!(is_private_or_local_host("::1"));
+        assert!(is_private_or_local_host("[::1]"));
+    }
+
+    #[test]
+    fn blocks_ipv6_multicast() {
+        assert!(is_private_or_local_host("ff02::1"));
+    }
+
+    #[test]
+    fn blocks_ipv6_link_local() {
+        assert!(is_private_or_local_host("fe80::1"));
+    }
+
+    #[test]
+    fn blocks_ipv6_unique_local() {
+        assert!(is_private_or_local_host("fd00::1"));
+    }
+
+    #[test]
+    fn blocks_ipv4_mapped_ipv6() {
+        assert!(is_private_or_local_host("::ffff:127.0.0.1"));
+        assert!(is_private_or_local_host("::ffff:192.168.1.1"));
+        assert!(is_private_or_local_host("::ffff:10.0.0.1"));
+    }
+
+    #[test]
+    fn allows_public_ipv4() {
+        assert!(!is_private_or_local_host("8.8.8.8"));
+        assert!(!is_private_or_local_host("1.1.1.1"));
+        assert!(!is_private_or_local_host("93.184.216.34"));
+    }
+
+    #[test]
+    fn blocks_ipv6_documentation_range() {
+        assert!(is_private_or_local_host("2001:db8::1"));
+    }
+
+    #[test]
+    fn allows_public_ipv6() {
+        assert!(!is_private_or_local_host("2607:f8b0:4004:800::200e"));
+    }
+
+    #[test]
+    fn blocks_shared_address_space() {
+        assert!(is_private_or_local_host("100.64.0.1"));
+        assert!(is_private_or_local_host("100.127.255.255"));
+        assert!(!is_private_or_local_host("100.63.0.1")); // Just below range
+        assert!(!is_private_or_local_host("100.128.0.1")); // Just above range
     }
 
     #[tokio::test]
@@ -612,23 +711,54 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_headers_redacts_sensitive() {
+    fn parse_headers_preserves_original_values() {
         let tool = test_tool(vec!["example.com"]);
         let headers = json!({
             "Authorization": "Bearer secret",
             "Content-Type": "application/json",
             "X-API-Key": "my-key"
         });
-        let sanitized = tool.sanitize_headers(&headers);
-        assert_eq!(sanitized.len(), 3);
-        assert!(sanitized
+        let parsed = tool.parse_headers(&headers);
+        assert_eq!(parsed.len(), 3);
+        assert!(parsed
             .iter()
-            .any(|(k, v)| k == "Authorization" && v == "***REDACTED***"));
-        assert!(sanitized
+            .any(|(k, v)| k == "Authorization" && v == "Bearer secret"));
+        assert!(parsed
             .iter()
-            .any(|(k, v)| k == "X-API-Key" && v == "***REDACTED***"));
-        assert!(sanitized
+            .any(|(k, v)| k == "X-API-Key" && v == "my-key"));
+        assert!(parsed
             .iter()
             .any(|(k, v)| k == "Content-Type" && v == "application/json"));
+    }
+
+    #[test]
+    fn redact_headers_for_display_redacts_sensitive() {
+        let headers = vec![
+            ("Authorization".into(), "Bearer secret".into()),
+            ("Content-Type".into(), "application/json".into()),
+            ("X-API-Key".into(), "my-key".into()),
+            ("X-Secret-Token".into(), "tok-123".into()),
+        ];
+        let redacted = HttpRequestTool::redact_headers_for_display(&headers);
+        assert_eq!(redacted.len(), 4);
+        assert!(redacted
+            .iter()
+            .any(|(k, v)| k == "Authorization" && v == "***REDACTED***"));
+        assert!(redacted
+            .iter()
+            .any(|(k, v)| k == "X-API-Key" && v == "***REDACTED***"));
+        assert!(redacted
+            .iter()
+            .any(|(k, v)| k == "X-Secret-Token" && v == "***REDACTED***"));
+        assert!(redacted
+            .iter()
+            .any(|(k, v)| k == "Content-Type" && v == "application/json"));
+    }
+
+    #[test]
+    fn redact_headers_does_not_alter_original() {
+        let headers = vec![("Authorization".into(), "Bearer real-token".into())];
+        let _ = HttpRequestTool::redact_headers_for_display(&headers);
+        assert_eq!(headers[0].1, "Bearer real-token");
     }
 }

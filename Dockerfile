@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 
 # ── Stage 1: Build ────────────────────────────────────────────
-FROM rust:1.93-slim-trixie AS builder
+FROM rust:1.93-slim-trixie@sha256:9663b80a1621253d30b146454f903de48f0af925c967be48c84745537cd35d8b AS builder
 
 WORKDIR /app
 
@@ -14,18 +14,22 @@ RUN apt-get update && apt-get install -y \
 COPY Cargo.toml Cargo.lock ./
 # Create dummy main.rs to build dependencies
 RUN mkdir src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release --locked
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo build --release --locked
 RUN rm -rf src
 
 # 2. Copy source code
 COPY . .
 # Touch main.rs to force rebuild
 RUN touch src/main.rs
-RUN cargo build --release --locked && \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    cargo build --release --locked && \
     strip target/release/zeroclaw
 
 # ── Stage 2: Permissions & Config Prep ───────────────────────
-FROM busybox:latest AS permissions
+FROM busybox:1.37@sha256:b3255e7dfbcd10cb367af0d409747d511aeb66dfac98cf30e97e87e4207dd76f AS permissions
 # Create directory structure (simplified workspace path)
 RUN mkdir -p /zeroclaw-data/.zeroclaw /zeroclaw-data/workspace
 
@@ -48,7 +52,7 @@ EOF
 RUN chown -R 65534:65534 /zeroclaw-data
 
 # ── Stage 3: Development Runtime (Debian) ────────────────────
-FROM debian:trixie-slim AS dev
+FROM debian:trixie-slim@sha256:f6e2cfac5cf956ea044b4bd75e6397b4372ad88fe00908045e9a0d21712ae3ba AS dev
 
 # Install runtime dependencies + basic debug tools
 RUN apt-get update && apt-get install -y \
@@ -86,7 +90,7 @@ ENTRYPOINT ["zeroclaw"]
 CMD ["gateway", "--port", "3000", "--host", "[::]"]
 
 # ── Stage 4: Production Runtime (Distroless) ─────────────────
-FROM gcr.io/distroless/cc-debian13:nonroot AS release
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:84fcd3c223b144b0cb6edc5ecc75641819842a9679a3a58fd6294bec47532bf7 AS release
 
 COPY --from=builder /app/target/release/zeroclaw /usr/local/bin/zeroclaw
 COPY --from=permissions /zeroclaw-data /zeroclaw-data

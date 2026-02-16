@@ -54,11 +54,14 @@ fn whatsapp_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String 
     format!("whatsapp_{}_{}", msg.sender, msg.id)
 }
 
+/// How often the rate limiter sweeps stale IP entries from its map.
+const RATE_LIMITER_SWEEP_INTERVAL_SECS: u64 = 300; // 5 minutes
+
 #[derive(Debug)]
 struct SlidingWindowRateLimiter {
     limit_per_window: u32,
     window: Duration,
-    requests: Mutex<HashMap<String, Vec<Instant>>>,
+    requests: Mutex<(HashMap<String, Vec<Instant>>, Instant)>,
 }
 
 impl SlidingWindowRateLimiter {
@@ -66,7 +69,7 @@ impl SlidingWindowRateLimiter {
         Self {
             limit_per_window,
             window,
-            requests: Mutex::new(HashMap::new()),
+            requests: Mutex::new((HashMap::new(), Instant::now())),
         }
     }
 
@@ -78,10 +81,20 @@ impl SlidingWindowRateLimiter {
         let now = Instant::now();
         let cutoff = now.checked_sub(self.window).unwrap_or_else(Instant::now);
 
-        let mut requests = self
+        let mut guard = self
             .requests
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (requests, last_sweep) = &mut *guard;
+
+        // Periodic sweep: remove IPs with no recent requests
+        if last_sweep.elapsed() >= Duration::from_secs(RATE_LIMITER_SWEEP_INTERVAL_SECS) {
+            requests.retain(|_, timestamps| {
+                timestamps.retain(|t| *t > cutoff);
+                !timestamps.is_empty()
+            });
+            *last_sweep = now;
+        }
 
         let entry = requests.entry(key.to_owned()).or_default();
         entry.retain(|instant| *instant > cutoff);
@@ -180,6 +193,7 @@ pub struct AppState {
     /// `WhatsApp` app secret for webhook signature verification (`X-Hub-Signature-256`)
     pub whatsapp_app_secret: Option<Arc<str>>,
     // ── Agent loop infrastructure ──
+    pub provider_name: String,
     pub tools_registry: Arc<Vec<Box<dyn Tool>>>,
     pub observer: Arc<dyn Observer>,
     pub system_prompt: Arc<str>,
@@ -205,12 +219,17 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let actual_port = listener.local_addr()?.port();
     let display_addr = format!("{host}:{actual_port}");
 
+    let provider_name = config
+        .default_provider
+        .as_deref()
+        .unwrap_or("openrouter")
+        .to_string();
     let model = config
         .default_model
         .clone()
         .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
     let provider: Arc<dyn Provider> = Arc::from(providers::create_routed_provider(
-        config.default_provider.as_deref().unwrap_or("openrouter"),
+        &provider_name,
         config.api_key.as_deref(),
         &config.reliability,
         &config.model_routes,
@@ -232,20 +251,26 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         Arc::from(observability::create_observer(&config.observability));
     let rt: Arc<dyn runtime::RuntimeAdapter> =
         Arc::from(runtime::create_runtime(&config.runtime)?);
-    let composio_key = if config.composio.enabled {
-        config.composio.api_key.as_deref()
+    let (composio_key, composio_entity_id) = if config.composio.enabled {
+        (
+            config.composio.api_key.as_deref(),
+            Some(config.composio.entity_id.as_str()),
+        )
     } else {
-        None
+        (None, None)
     };
     let tools_registry = Arc::new(tools::all_tools_with_runtime(
         &security,
         rt,
         mem.clone(),
         composio_key,
+        composio_entity_id,
         &config.browser,
         &config.http_request,
+        &config.workspace_dir,
         &config.agents,
         config.api_key.as_deref(),
+        &config,
     ));
 
     // Build system prompt with tool instructions
@@ -260,6 +285,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         ("self_upgrade", "Check for and apply ZeroClaw updates. Use check_only=true to see pending changes; set check_only=false with approved=true to pull and rebuild."),
         ("computer", "See the screen and control mouse/keyboard to interact with any application. Actions: screenshot (see screen via vision AI), click/double_click/right_click (mouse), type (keyboard), key (combos like cmd+c), scroll, open_app, cursor_position. Always screenshot first, then act."),
     ];
+    let bootstrap_max_chars = if config.agent.compact_context {
+        Some(6000)
+    } else {
+        None
+    };
     let mut system_prompt_str = build_system_prompt(
         &config.workspace_dir,
         &model,
@@ -268,6 +298,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         Some(&config.identity),
         &config.model_routes,
         Some(&config.autonomy),
+        bootstrap_max_chars,
     );
     system_prompt_str.push_str(&build_tool_instructions(&tools_registry));
     let system_prompt: Arc<str> = Arc::from(system_prompt_str);
@@ -405,6 +436,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     // Build shared state
     let state = AppState {
         provider,
+        provider_name,
         model,
         temperature,
         mem,
@@ -569,8 +601,9 @@ async fn handle_webhook(
     let Json(webhook_body) = match body {
         Ok(b) => b,
         Err(e) => {
+            tracing::warn!("Webhook JSON parse error: {e}");
             let err = serde_json::json!({
-                "error": format!("Invalid JSON: {e}. Expected: {{\"message\": \"...\"}}")
+                "error": "Invalid JSON body. Expected: {\"message\": \"...\"}"
             });
             return (StatusCode::BAD_REQUEST, Json(err));
         }
@@ -605,7 +638,7 @@ async fn handle_webhook(
             .await;
     }
 
-    // ── Model selection: manual override or default ──
+    // --- ZeroClaw fork: model selection, per-user history, channel awareness ---
     // Auto-routing between models is disabled — keyword-based classification
     // is too fragile and misroutes tool-use tasks to models that can't handle
     // them. All messages use the primary model unless explicitly overridden.
@@ -652,8 +685,10 @@ async fn handle_webhook(
         &mut history,
         &state.tools_registry,
         state.observer.as_ref(),
+        &state.provider_name,
         &selected_model,
         state.temperature,
+        true, // silent — channel mode
     )
     .await
     {
@@ -897,7 +932,7 @@ async fn handle_whatsapp_message(
         // Call the LLM
         match state
             .provider
-            .chat(&msg.content, &state.model, state.temperature)
+            .simple_chat(&msg.content, &state.model, state.temperature)
             .await
         {
             Ok(response) => {
@@ -980,6 +1015,55 @@ mod tests {
         assert!(limiter.allow_pair("127.0.0.1"));
         assert!(limiter.allow_pair("127.0.0.1"));
         assert!(!limiter.allow_pair("127.0.0.1"));
+    }
+
+    #[test]
+    fn rate_limiter_sweep_removes_stale_entries() {
+        let limiter = SlidingWindowRateLimiter::new(10, Duration::from_secs(60));
+        // Add entries for multiple IPs
+        assert!(limiter.allow("ip-1"));
+        assert!(limiter.allow("ip-2"));
+        assert!(limiter.allow("ip-3"));
+
+        {
+            let guard = limiter
+                .requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(guard.0.len(), 3);
+        }
+
+        // Force a sweep by backdating last_sweep
+        {
+            let mut guard = limiter
+                .requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.1 = Instant::now() - Duration::from_secs(RATE_LIMITER_SWEEP_INTERVAL_SECS + 1);
+            // Clear timestamps for ip-2 and ip-3 to simulate stale entries
+            guard.0.get_mut("ip-2").unwrap().clear();
+            guard.0.get_mut("ip-3").unwrap().clear();
+        }
+
+        // Next allow() call should trigger sweep and remove stale entries
+        assert!(limiter.allow("ip-1"));
+
+        {
+            let guard = limiter
+                .requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(guard.0.len(), 1, "Stale entries should have been swept");
+            assert!(guard.0.contains_key("ip-1"));
+        }
+    }
+
+    #[test]
+    fn rate_limiter_zero_limit_always_allows() {
+        let limiter = SlidingWindowRateLimiter::new(0, Duration::from_secs(60));
+        for _ in 0..100 {
+            assert!(limiter.allow("any-key"));
+        }
     }
 
     #[test]
@@ -1145,6 +1229,7 @@ mod tests {
 
         let state = AppState {
             provider,
+            provider_name: "test".into(),
             model: "test-model".into(),
             temperature: 0.0,
             mem: memory,
@@ -1215,6 +1300,7 @@ mod tests {
             observer: Arc::new(NoopObserver),
             system_prompt: Arc::from("test"),
             conversations: Arc::new(DashMap::new()),
+            provider_name: "test".into(),
         };
 
         let headers = HeaderMap::new();
