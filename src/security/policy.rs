@@ -334,7 +334,8 @@ impl SecurityPolicy {
         false
     }
 
-    /// Commands that would kill the daemon process itself.
+    /// Commands that would kill the daemon process itself or bypass the
+    /// safe self-upgrade pipeline.
     /// These are blocked unconditionally — the `self_upgrade` tool provides
     /// a safe alternative that builds, deploys, and restarts via a detached process.
     pub fn is_self_destructive(command: &str) -> bool {
@@ -380,6 +381,21 @@ impl SecurityPolicy {
                  and restart safely without killing yourself."
                     .into(),
             );
+        }
+
+        // Block cargo build in the zeroclaw workspace — must use self_upgrade tool
+        // which handles the full build→copy→sign→restart pipeline safely.
+        let lower = command.to_ascii_lowercase();
+        if lower.contains("cargo build") {
+            let ws = self.workspace_dir.to_string_lossy().to_ascii_lowercase();
+            if ws.contains("zeroclaw") {
+                return Err(
+                    "BLOCKED: Do not run `cargo build` manually for ZeroClaw. \
+                     Use the `self_upgrade` tool with `check_only=false, approved=true` — \
+                     it handles build, deploy, codesign, and safe restart automatically."
+                        .into(),
+                );
+            }
         }
 
         // Catastrophic commands are permanently blocked, no approval override
@@ -912,6 +928,31 @@ mod tests {
         let result = p.validate_command_execution("launchctl bootout gui/501 com.zeroclaw.daemon.plist", true);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("self_upgrade"));
+    }
+
+    #[test]
+    fn validate_blocks_cargo_build_in_zeroclaw_workspace() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["cargo".into()],
+            workspace_dir: PathBuf::from("/Users/koriel/Development/zeroclaw"),
+            ..SecurityPolicy::default()
+        };
+        let result = p.validate_command_execution("cargo build --release", true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("self_upgrade"));
+    }
+
+    #[test]
+    fn validate_allows_cargo_build_in_other_workspace() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["cargo".into()],
+            workspace_dir: PathBuf::from("/Users/koriel/Development/other-project"),
+            ..SecurityPolicy::default()
+        };
+        let result = p.validate_command_execution("cargo build --release", true);
+        assert!(result.is_ok());
     }
 
     // ── is_path_allowed ─────────────────────────────────────

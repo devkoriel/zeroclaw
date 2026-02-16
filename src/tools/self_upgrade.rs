@@ -57,11 +57,10 @@ impl Tool for SelfUpgradeTool {
     }
 
     fn description(&self) -> &str {
-        "Check for and apply ZeroClaw updates from the git repository. \
+        "Build, deploy, and restart ZeroClaw. This is the ONLY safe way to redeploy yourself. \
          Use check_only=true (default) to see pending changes; \
-         set check_only=false with approved=true to pull, build, deploy, and restart. \
-         Alternatively, use the shell tool to run `bash scripts/deploy.sh` from the repo root \
-         to rebuild and redeploy without pulling."
+         set check_only=false with approved=true to pull, build, copy binary, codesign, and restart. \
+         Do NOT use shell commands for building or restarting — they are blocked by security policy."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -173,10 +172,28 @@ impl Tool for SelfUpgradeTool {
         };
 
         let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/koriel".into());
-        let path_env = format!(
-            "{home}/.cargo/bin:/opt/homebrew/bin:/opt/homebrew/sbin:\
-             /usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        );
+        // Build PATH with cargo/rustup toolchain discovery
+        let mut path_parts: Vec<String> = vec![format!("{home}/.cargo/bin")];
+        // Discover rustup toolchain bin dirs (cargo may live here)
+        let rustup_toolchains = format!("{home}/.rustup/toolchains");
+        if let Ok(entries) = std::fs::read_dir(&rustup_toolchains) {
+            for entry in entries.flatten() {
+                let bin = entry.path().join("bin");
+                if bin.is_dir() {
+                    path_parts.push(bin.to_string_lossy().into_owned());
+                }
+            }
+        }
+        path_parts.extend([
+            "/opt/homebrew/bin".into(),
+            "/opt/homebrew/sbin".into(),
+            "/usr/local/bin".into(),
+            "/usr/bin".into(),
+            "/bin".into(),
+            "/usr/sbin".into(),
+            "/sbin".into(),
+        ]);
+        let path_env = path_parts.join(":");
 
         // Phase 1: Build
         let build = Command::new("cargo")

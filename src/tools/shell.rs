@@ -131,10 +131,21 @@ impl Tool for ShellTool {
                 let home_dirs: Vec<String> = if home.is_empty() {
                     vec![]
                 } else {
-                    vec![
+                    let mut dirs = vec![
                         format!("{home}/.cargo/bin"),
                         format!("{home}/.local/bin"),
-                    ]
+                    ];
+                    // Discover rustup toolchain bin (cargo may live here instead of .cargo/bin)
+                    let rustup_toolchains = format!("{home}/.rustup/toolchains");
+                    if let Ok(entries) = std::fs::read_dir(&rustup_toolchains) {
+                        for entry in entries.flatten() {
+                            let bin = entry.path().join("bin");
+                            if bin.is_dir() {
+                                dirs.push(bin.to_string_lossy().into_owned());
+                            }
+                        }
+                    }
+                    dirs
                 };
                 for dir in EXTRA_PATH_DIRS.iter().map(|s| s.to_string()).chain(home_dirs) {
                     if std::path::Path::new(&dir).is_dir() {
