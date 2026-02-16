@@ -105,6 +105,38 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the git commit hash for the running binary.
+/// Tries `GIT_COMMIT` env var first (set at build time), then falls back
+/// to running `git rev-parse --short HEAD` in the source repo.
+fn resolve_git_commit() -> String {
+    // Build-time env (if set via build.rs or CI)
+    if let Some(commit) = option_env!("GIT_COMMIT") {
+        if !commit.is_empty() {
+            return commit.to_string();
+        }
+    }
+
+    // Runtime fallback: query the repo
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/koriel".into());
+    let repo = std::path::PathBuf::from(&home).join("Development/zeroclaw");
+    if repo.join(".git").is_dir() {
+        if let Ok(output) = std::process::Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .current_dir(&repo)
+            .output()
+        {
+            if output.status.success() {
+                let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !sha.is_empty() {
+                    return sha;
+                }
+            }
+        }
+    }
+
+    "unknown".into()
+}
+
 /// Send a "I'm back" notification to all allowed Telegram users on daemon startup.
 async fn send_startup_notification(config: &Config) {
     let Some(ref tg_config) = config.channels_config.telegram else {
@@ -118,10 +150,11 @@ async fn send_startup_notification(config: &Config) {
 
     let now = Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
     let version = env!("CARGO_PKG_VERSION");
+    let commit = resolve_git_commit();
     let message = format!(
         "🦀 <b>ZeroClaw is back online!</b>\n\n\
          ✅ Daemon restarted successfully\n\
-         📦 Version: {version}\n\
+         📦 Version: {version} ({commit})\n\
          🕐 {now}\n\n\
          All systems operational. Ready to assist."
     );
