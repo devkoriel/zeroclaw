@@ -123,6 +123,7 @@ impl Tool for SelfUpgradeTool {
         "Build, deploy, and restart ZeroClaw. This is the ONLY safe way to redeploy yourself. \
          Use check_only=true (default) to see pending changes; \
          set check_only=false with approved=true to pull, build, copy binary, codesign, and restart. \
+         Use force=true to rebuild and redeploy even when already up to date (e.g. after local edits). \
          Do NOT use shell commands for building or restarting — they are blocked by security policy."
     }
 
@@ -139,6 +140,11 @@ impl Tool for SelfUpgradeTool {
                     "type": "boolean",
                     "description": "Set true to approve pulling changes and rebuilding. Required when check_only is false.",
                     "default": false
+                },
+                "force": {
+                    "type": "boolean",
+                    "description": "Force rebuild and redeploy even if already up to date. Useful after local file edits.",
+                    "default": false
                 }
             }
         })
@@ -151,6 +157,10 @@ impl Tool for SelfUpgradeTool {
             .unwrap_or(true);
         let approved = args
             .get("approved")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let force = args
+            .get("force")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
@@ -191,7 +201,9 @@ impl Tool for SelfUpgradeTool {
             .trim()
             .to_string();
 
-        if pending.trim().is_empty() {
+        let has_pending = !pending.trim().is_empty();
+
+        if !has_pending && !force {
             return Ok(ToolResult {
                 success: true,
                 output: format!("Already up to date (HEAD: {current_sha})."),
@@ -200,39 +212,53 @@ impl Tool for SelfUpgradeTool {
         }
 
         if check_only {
-            let commit_count = pending.lines().count();
+            if has_pending {
+                let commit_count = pending.lines().count();
+                return Ok(ToolResult {
+                    success: true,
+                    output: format!(
+                        "{commit_count} new commit(s) available ({current_sha} → {remote_sha}):\n{pending}"
+                    ),
+                    error: None,
+                });
+            }
             return Ok(ToolResult {
                 success: true,
-                output: format!(
-                    "{commit_count} new commit(s) available ({current_sha} → {remote_sha}):\n{pending}"
-                ),
+                output: format!("Already up to date (HEAD: {current_sha}). Use force=true to rebuild anyway."),
                 error: None,
             });
         }
 
         // Upgrade requested — require approval
         if !approved {
-            let commit_count = pending.lines().count();
+            let msg = if has_pending {
+                let commit_count = pending.lines().count();
+                format!(
+                    "{commit_count} new commit(s) will be applied ({current_sha} → {remote_sha}):\n{pending}"
+                )
+            } else {
+                format!("Force rebuild requested at {current_sha} (no new commits).")
+            };
             return Ok(ToolResult {
                 success: false,
-                output: format!(
-                    "{commit_count} new commit(s) will be applied ({current_sha} → {remote_sha}):\n{pending}"
-                ),
+                output: msg,
                 error: Some("APPROVAL_REQUIRED: Self-upgrade will pull changes and rebuild. Re-call with approved=true to proceed.".into()),
             });
         }
 
-        // Pull changes
-        let pull_output = match self.run_git(&["pull", "origin", "main"]) {
-            Ok(o) => o,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("git pull failed: {e}")),
-                });
-            }
-        };
+        // Pull changes (only if there are pending commits)
+        if has_pending {
+            let _pull_output = match self.run_git(&["pull", "origin", "main"]) {
+                Ok(o) => o,
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("git pull failed: {e}")),
+                    });
+                }
+            };
+        }
 
         let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/koriel".into());
         // Build PATH with asdf/cargo/rustup toolchain discovery
@@ -287,7 +313,7 @@ impl Tool for SelfUpgradeTool {
                 });
             }
         };
-        let build_stderr = String::from_utf8_lossy(&build_output.stderr);
+        let _build_stderr = String::from_utf8_lossy(&build_output.stderr);
 
         // Phase 2: Copy binary to app bundle (daemon is still running old binary — this is safe)
         let release_bin = self.repo_dir.join("target/release/zeroclaw");
@@ -325,8 +351,13 @@ impl Tool for SelfUpgradeTool {
 
         // Phase 4: Notify user BEFORE restart (since daemon dies during restart
         // and the LLM response will never make it back to Telegram).
+        let deploy_label = if has_pending {
+            format!("{current_sha} → {remote_sha}")
+        } else {
+            format!("{current_sha} (force rebuild)")
+        };
         send_telegram_notification(&format!(
-            "🔄 <b>Deploying update</b> ({current_sha} → {remote_sha})\n\n\
+            "🔄 <b>Deploying update</b> ({deploy_label})\n\n\
              ✅ Build: success\n\
              ✅ Binary copied & signed\n\
              ⏳ Restarting in ~5 seconds...\n\n\
@@ -353,7 +384,7 @@ impl Tool for SelfUpgradeTool {
         Ok(ToolResult {
             success: true,
             output: format!(
-                "Upgrade & deploy complete ({current_sha} → {remote_sha}).\n\
+                "Upgrade & deploy complete ({deploy_label}).\n\
                  Build: success. Binary copied & signed.\n\
                  Telegram notification sent. Restarting in ~5s.",
             ),
@@ -378,6 +409,7 @@ mod tests {
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["check_only"].is_object());
         assert!(schema["properties"]["approved"].is_object());
+        assert!(schema["properties"]["force"].is_object());
     }
 
     #[tokio::test]
