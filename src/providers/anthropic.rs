@@ -19,11 +19,48 @@ struct ChatRequest {
     temperature: f64,
 }
 
+// --- ZeroClaw fork: support multimodal content for vision ---
 #[derive(Debug, Serialize)]
 struct Message {
     role: String,
-    content: String,
+    content: serde_json::Value,
 }
+
+impl Message {
+    fn from_chat_message(m: &crate::providers::traits::ChatMessage) -> Self {
+        let content = if let Some(ref parts) = m.parts {
+            // Anthropic vision format
+            let content_parts: Vec<serde_json::Value> = parts
+                .iter()
+                .map(|p| match p.content_type {
+                    crate::providers::traits::ContentPartType::Text => {
+                        serde_json::json!({"type": "text", "text": p.text.as_deref().unwrap_or("")})
+                    }
+                    crate::providers::traits::ContentPartType::Image => {
+                        let mime = p.mime_type.as_deref().unwrap_or("image/jpeg");
+                        let data = p.image_base64.as_deref().unwrap_or("");
+                        serde_json::json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": mime,
+                                "data": data
+                            }
+                        })
+                    }
+                })
+                .collect();
+            serde_json::Value::Array(content_parts)
+        } else {
+            serde_json::Value::String(m.content.clone())
+        };
+        Self {
+            role: m.role.clone(),
+            content,
+        }
+    }
+}
+// --- end ZeroClaw fork ---
 
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
@@ -52,7 +89,7 @@ impl AnthropicProvider {
                 .map(ToString::to_string),
             base_url,
             client: Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
+                .timeout(std::time::Duration::from_secs(600))
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
@@ -85,7 +122,7 @@ impl Provider for AnthropicProvider {
             system: system_prompt.map(ToString::to_string),
             messages: vec![Message {
                 role: "user".to_string(),
-                content: message.to_string(),
+                content: serde_json::Value::String(message.to_string()),
             }],
             temperature,
         };
@@ -209,7 +246,7 @@ mod tests {
             system: None,
             messages: vec![Message {
                 role: "user".to_string(),
-                content: "hello".to_string(),
+                content: serde_json::Value::String("hello".to_string()),
             }],
             temperature: 0.7,
         };
@@ -230,7 +267,7 @@ mod tests {
             system: Some("You are ZeroClaw".to_string()),
             messages: vec![Message {
                 role: "user".to_string(),
-                content: "hello".to_string(),
+                content: serde_json::Value::String("hello".to_string()),
             }],
             temperature: 0.7,
         };

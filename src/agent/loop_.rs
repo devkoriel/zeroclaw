@@ -17,7 +17,7 @@ use uuid::Uuid;
 /// Maximum agentic tool-use iterations per user message to prevent runaway loops.
 /// GUI automation tasks (screenshot→analyze→click→verify) typically need ~5 iterations
 /// per action, so this must be high enough for multi-step workflows.
-pub const MAX_TOOL_ITERATIONS: usize = 25;
+pub const MAX_TOOL_ITERATIONS: usize = 200;
 
 /// Maximum characters retained per tool result to prevent a single output
 /// from dominating the conversation history budget.
@@ -1221,7 +1221,7 @@ Done."#;
     fn max_tool_iterations_is_reasonable() {
         // Recovery: MAX_TOOL_ITERATIONS should be set to prevent runaway loops
         assert!(MAX_TOOL_ITERATIONS > 0);
-        assert!(MAX_TOOL_ITERATIONS <= 100);
+        assert!(MAX_TOOL_ITERATIONS <= 500);
     }
 
     #[test]

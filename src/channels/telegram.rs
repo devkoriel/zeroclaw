@@ -1,7 +1,7 @@
-use super::traits::{Channel, ChannelMessage};
+use super::traits::{Channel, ChannelMessage, MediaAttachment, MediaType};
 use async_trait::async_trait;
 use reqwest::multipart::{Form, Part};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 /// Telegram channel — long-polls the Bot API for updates
@@ -330,6 +330,432 @@ impl TelegramChannel {
         Ok(())
     }
 
+    // --- ZeroClaw fork: comprehensive media extraction ---
+
+    /// Extract text content and media attachments from a Telegram message.
+    /// Handles all Telegram-compatible media types.
+    async fn extract_message_content(
+        &self,
+        message: &serde_json::Value,
+    ) -> (String, Vec<MediaAttachment>) {
+        let mut attachments = Vec::new();
+        let caption = message
+            .get("caption")
+            .and_then(|c| c.as_str())
+            .map(String::from);
+
+        // Text message (highest priority)
+        if let Some(text) = message.get("text").and_then(|t| t.as_str()) {
+            return (text.to_string(), attachments);
+        }
+
+        // Photo — array of PhotoSize, pick the largest
+        if let Some(photos) = message.get("photo").and_then(|p| p.as_array()) {
+            if let Some(largest) = photos.last() {
+                let mut att = MediaAttachment::new(MediaType::Photo);
+                att.file_id = largest.get("file_id").and_then(|f| f.as_str()).map(String::from);
+                if let Some(w) = largest.get("width").and_then(|v| v.as_u64()) {
+                    att.metadata.insert("width".into(), w.to_string());
+                }
+                if let Some(h) = largest.get("height").and_then(|v| v.as_u64()) {
+                    att.metadata.insert("height".into(), h.to_string());
+                }
+                att.file_size = largest.get("file_size").and_then(|v| v.as_u64());
+                att.caption = caption.clone();
+                att.mime_type = Some("image/jpeg".into());
+                attachments.push(att);
+            }
+            let text = caption.unwrap_or_else(|| "[Photo]".into());
+            return (text, attachments);
+        }
+
+        // Document
+        if let Some(doc) = message.get("document") {
+            let mut att = MediaAttachment::new(MediaType::Document);
+            att.file_id = doc.get("file_id").and_then(|f| f.as_str()).map(String::from);
+            att.file_name = doc.get("file_name").and_then(|f| f.as_str()).map(String::from);
+            att.mime_type = doc.get("mime_type").and_then(|f| f.as_str()).map(String::from);
+            att.file_size = doc.get("file_size").and_then(|v| v.as_u64());
+            att.caption = caption.clone();
+            attachments.push(att);
+            let name = message.get("document")
+                .and_then(|d| d.get("file_name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("file");
+            let text = caption.unwrap_or_else(|| format!("[Document: {name}]"));
+            return (text, attachments);
+        }
+
+        // Video
+        if let Some(vid) = message.get("video") {
+            let mut att = MediaAttachment::new(MediaType::Video);
+            att.file_id = vid.get("file_id").and_then(|f| f.as_str()).map(String::from);
+            att.mime_type = vid.get("mime_type").and_then(|f| f.as_str()).map(String::from);
+            att.file_size = vid.get("file_size").and_then(|v| v.as_u64());
+            if let Some(dur) = vid.get("duration").and_then(|v| v.as_u64()) {
+                att.metadata.insert("duration".into(), dur.to_string());
+            }
+            att.caption = caption.clone();
+            attachments.push(att);
+            let dur = vid.get("duration").and_then(|v| v.as_u64()).unwrap_or(0);
+            let text = caption.unwrap_or_else(|| format!("[Video, {dur}s]"));
+            return (text, attachments);
+        }
+
+        // Audio
+        if let Some(aud) = message.get("audio") {
+            let mut att = MediaAttachment::new(MediaType::Audio);
+            att.file_id = aud.get("file_id").and_then(|f| f.as_str()).map(String::from);
+            att.mime_type = aud.get("mime_type").and_then(|f| f.as_str()).map(String::from);
+            att.file_size = aud.get("file_size").and_then(|v| v.as_u64());
+            if let Some(dur) = aud.get("duration").and_then(|v| v.as_u64()) {
+                att.metadata.insert("duration".into(), dur.to_string());
+            }
+            if let Some(title) = aud.get("title").and_then(|t| t.as_str()) {
+                att.metadata.insert("title".into(), title.into());
+            }
+            if let Some(performer) = aud.get("performer").and_then(|p| p.as_str()) {
+                att.metadata.insert("performer".into(), performer.into());
+            }
+            att.caption = caption.clone();
+            attachments.push(att);
+            let title = aud.get("title").and_then(|t| t.as_str()).unwrap_or("audio");
+            let dur = aud.get("duration").and_then(|v| v.as_u64()).unwrap_or(0);
+            let text = caption.unwrap_or_else(|| format!("[Audio: {title}, {dur}s]"));
+            return (text, attachments);
+        }
+
+        // Voice
+        if let Some(voice) = message.get("voice") {
+            let mut att = MediaAttachment::new(MediaType::Voice);
+            att.file_id = voice.get("file_id").and_then(|f| f.as_str()).map(String::from);
+            att.mime_type = Some("audio/ogg".into());
+            att.file_size = voice.get("file_size").and_then(|v| v.as_u64());
+            if let Some(dur) = voice.get("duration").and_then(|v| v.as_u64()) {
+                att.metadata.insert("duration".into(), dur.to_string());
+            }
+            att.caption = caption.clone();
+            attachments.push(att);
+            let dur = voice.get("duration").and_then(|v| v.as_u64()).unwrap_or(0);
+            let text = caption.unwrap_or_else(|| format!("[Voice message, {dur}s]"));
+            return (text, attachments);
+        }
+
+        // Video note (round video)
+        if let Some(vn) = message.get("video_note") {
+            let mut att = MediaAttachment::new(MediaType::VideoNote);
+            att.file_id = vn.get("file_id").and_then(|f| f.as_str()).map(String::from);
+            att.file_size = vn.get("file_size").and_then(|v| v.as_u64());
+            if let Some(dur) = vn.get("duration").and_then(|v| v.as_u64()) {
+                att.metadata.insert("duration".into(), dur.to_string());
+            }
+            attachments.push(att);
+            let dur = vn.get("duration").and_then(|v| v.as_u64()).unwrap_or(0);
+            return (format!("[Video note, {dur}s]"), attachments);
+        }
+
+        // Animation (GIF)
+        if let Some(anim) = message.get("animation") {
+            let mut att = MediaAttachment::new(MediaType::Animation);
+            att.file_id = anim.get("file_id").and_then(|f| f.as_str()).map(String::from);
+            att.mime_type = anim.get("mime_type").and_then(|f| f.as_str()).map(String::from);
+            att.file_size = anim.get("file_size").and_then(|v| v.as_u64());
+            att.caption = caption.clone();
+            attachments.push(att);
+            let text = caption.unwrap_or_else(|| "[Animation/GIF]".into());
+            return (text, attachments);
+        }
+
+        // Sticker
+        if let Some(sticker) = message.get("sticker") {
+            let mut att = MediaAttachment::new(MediaType::Sticker);
+            att.file_id = sticker.get("file_id").and_then(|f| f.as_str()).map(String::from);
+            att.file_size = sticker.get("file_size").and_then(|v| v.as_u64());
+            if let Some(emoji) = sticker.get("emoji").and_then(|e| e.as_str()) {
+                att.metadata.insert("emoji".into(), emoji.into());
+            }
+            if let Some(set) = sticker.get("set_name").and_then(|s| s.as_str()) {
+                att.metadata.insert("set_name".into(), set.into());
+            }
+            let is_animated = sticker.get("is_animated").and_then(|v| v.as_bool()).unwrap_or(false);
+            att.mime_type = Some(if is_animated { "application/x-tgsticker" } else { "image/webp" }.into());
+            attachments.push(att);
+            let emoji = sticker.get("emoji").and_then(|e| e.as_str()).unwrap_or("");
+            return (format!("[Sticker {emoji}]"), attachments);
+        }
+
+        // Location (no file download)
+        if let Some(loc) = message.get("location") {
+            let lat = loc.get("latitude").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let lon = loc.get("longitude").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let mut att = MediaAttachment::new(MediaType::Location);
+            att.metadata.insert("latitude".into(), lat.to_string());
+            att.metadata.insert("longitude".into(), lon.to_string());
+            attachments.push(att);
+            return (format!("[Location: {lat:.6}, {lon:.6}]"), attachments);
+        }
+
+        // Venue (location + name)
+        if let Some(venue) = message.get("venue") {
+            let title = venue.get("title").and_then(|t| t.as_str()).unwrap_or("Unknown venue");
+            let address = venue.get("address").and_then(|a| a.as_str()).unwrap_or("");
+            let mut att = MediaAttachment::new(MediaType::Venue);
+            att.metadata.insert("title".into(), title.into());
+            att.metadata.insert("address".into(), address.into());
+            if let Some(loc) = venue.get("location") {
+                if let Some(lat) = loc.get("latitude").and_then(|v| v.as_f64()) {
+                    att.metadata.insert("latitude".into(), lat.to_string());
+                }
+                if let Some(lon) = loc.get("longitude").and_then(|v| v.as_f64()) {
+                    att.metadata.insert("longitude".into(), lon.to_string());
+                }
+            }
+            attachments.push(att);
+            return (format!("[Venue: {title}, {address}]"), attachments);
+        }
+
+        // Contact
+        if let Some(contact) = message.get("contact") {
+            let phone = contact.get("phone_number").and_then(|p| p.as_str()).unwrap_or("");
+            let first = contact.get("first_name").and_then(|f| f.as_str()).unwrap_or("");
+            let last = contact.get("last_name").and_then(|l| l.as_str()).unwrap_or("");
+            let mut att = MediaAttachment::new(MediaType::Contact);
+            att.metadata.insert("phone_number".into(), phone.into());
+            att.metadata.insert("first_name".into(), first.into());
+            if !last.is_empty() {
+                att.metadata.insert("last_name".into(), last.into());
+            }
+            attachments.push(att);
+            let name = if last.is_empty() { first.to_string() } else { format!("{first} {last}") };
+            return (format!("[Contact: {name}, {phone}]"), attachments);
+        }
+
+        // Poll
+        if let Some(poll) = message.get("poll") {
+            let question = poll.get("question").and_then(|q| q.as_str()).unwrap_or("");
+            let mut att = MediaAttachment::new(MediaType::Poll);
+            att.metadata.insert("question".into(), question.into());
+            if let Some(options) = poll.get("options").and_then(|o| o.as_array()) {
+                let opts: Vec<&str> = options
+                    .iter()
+                    .filter_map(|o| o.get("text").and_then(|t| t.as_str()))
+                    .collect();
+                att.metadata.insert("options".into(), opts.join(", "));
+            }
+            attachments.push(att);
+            return (format!("[Poll: {question}]"), attachments);
+        }
+
+        // Unknown message type — skip
+        tracing::debug!("Telegram: skipping unsupported message type");
+        (String::new(), attachments)
+    }
+
+    // --- end ZeroClaw fork ---
+
+    // --- ZeroClaw fork: file download + new send methods ---
+
+    /// Download a Telegram file by file_id to the local workspace.
+    /// Returns the local filesystem path.
+    pub async fn download_file(
+        &self,
+        file_id: &str,
+        workspace: &Path,
+    ) -> anyhow::Result<PathBuf> {
+        // Step 1: Call getFile to get the file_path
+        let body = serde_json::json!({ "file_id": file_id });
+        let resp = self
+            .client
+            .post(self.api_url("getFile"))
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await?;
+            anyhow::bail!("Telegram getFile failed: {err}");
+        }
+
+        let data: serde_json::Value = resp.json().await?;
+        let remote_path = data
+            .get("result")
+            .and_then(|r| r.get("file_path"))
+            .and_then(|p| p.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Telegram getFile: missing file_path"))?;
+
+        // Step 2: Download the file
+        let download_url = format!(
+            "https://api.telegram.org/file/bot{}/{remote_path}",
+            self.bot_token
+        );
+        let file_resp = self.client.get(&download_url).send().await?;
+        if !file_resp.status().is_success() {
+            anyhow::bail!("Telegram file download failed: {}", file_resp.status());
+        }
+        let bytes = file_resp.bytes().await?;
+
+        // Step 3: Save to workspace/downloads/
+        let downloads_dir = workspace.join("downloads");
+        tokio::fs::create_dir_all(&downloads_dir).await?;
+
+        let file_name = remote_path
+            .rsplit('/')
+            .next()
+            .unwrap_or("file");
+        let local_path = downloads_dir.join(format!("{}_{file_name}", &file_id[..8.min(file_id.len())]));
+        tokio::fs::write(&local_path, &bytes).await?;
+
+        tracing::info!("Telegram file downloaded: {file_id} -> {}", local_path.display());
+        Ok(local_path)
+    }
+
+    /// Send a sticker to a Telegram chat
+    pub async fn send_sticker(
+        &self,
+        chat_id: &str,
+        file_path: &Path,
+    ) -> anyhow::Result<()> {
+        let file_bytes = tokio::fs::read(file_path).await?;
+        let part = Part::bytes(file_bytes).file_name("sticker.webp".to_string());
+
+        let form = Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part("sticker", part);
+
+        let resp = self
+            .client
+            .post(self.api_url("sendSticker"))
+            .multipart(form)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await?;
+            anyhow::bail!("Telegram sendSticker failed: {err}");
+        }
+        Ok(())
+    }
+
+    /// Send an animation (GIF) to a Telegram chat
+    pub async fn send_animation(
+        &self,
+        chat_id: &str,
+        file_path: &Path,
+        caption: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let file_bytes = tokio::fs::read(file_path).await?;
+        let part = Part::bytes(file_bytes).file_name("animation.gif".to_string());
+
+        let mut form = Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part("animation", part);
+
+        if let Some(cap) = caption {
+            form = form.text("caption", cap.to_string());
+        }
+
+        let resp = self
+            .client
+            .post(self.api_url("sendAnimation"))
+            .multipart(form)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await?;
+            anyhow::bail!("Telegram sendAnimation failed: {err}");
+        }
+        Ok(())
+    }
+
+    /// Send a location to a Telegram chat
+    pub async fn send_location(
+        &self,
+        chat_id: &str,
+        latitude: f64,
+        longitude: f64,
+    ) -> anyhow::Result<()> {
+        let body = serde_json::json!({
+            "chat_id": chat_id,
+            "latitude": latitude,
+            "longitude": longitude
+        });
+
+        let resp = self
+            .client
+            .post(self.api_url("sendLocation"))
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await?;
+            anyhow::bail!("Telegram sendLocation failed: {err}");
+        }
+        Ok(())
+    }
+
+    /// Send a video note (round video) to a Telegram chat
+    pub async fn send_video_note(
+        &self,
+        chat_id: &str,
+        file_path: &Path,
+    ) -> anyhow::Result<()> {
+        let file_bytes = tokio::fs::read(file_path).await?;
+        let part = Part::bytes(file_bytes).file_name("video_note.mp4".to_string());
+
+        let form = Form::new()
+            .text("chat_id", chat_id.to_string())
+            .part("video_note", part);
+
+        let resp = self
+            .client
+            .post(self.api_url("sendVideoNote"))
+            .multipart(form)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await?;
+            anyhow::bail!("Telegram sendVideoNote failed: {err}");
+        }
+        Ok(())
+    }
+
+    /// Send a contact to a Telegram chat
+    pub async fn send_contact(
+        &self,
+        chat_id: &str,
+        phone_number: &str,
+        first_name: &str,
+        last_name: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let mut body = serde_json::json!({
+            "chat_id": chat_id,
+            "phone_number": phone_number,
+            "first_name": first_name
+        });
+
+        if let Some(last) = last_name {
+            body["last_name"] = serde_json::Value::String(last.to_string());
+        }
+
+        let resp = self
+            .client
+            .post(self.api_url("sendContact"))
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await?;
+            anyhow::bail!("Telegram sendContact failed: {err}");
+        }
+        Ok(())
+    }
+
+    // --- end ZeroClaw fork ---
+
     /// Send a photo by URL (Telegram will download it)
     pub async fn send_photo_by_url(
         &self,
@@ -464,10 +890,7 @@ impl Channel for TelegramChannel {
                         continue;
                     };
 
-                    let Some(text) = message.get("text").and_then(serde_json::Value::as_str) else {
-                        continue;
-                    };
-
+                    // --- ZeroClaw fork: parse all Telegram media types ---
                     let username_opt = message
                         .get("from")
                         .and_then(|f| f.get("username"))
@@ -511,25 +934,48 @@ Allowlist Telegram @username or numeric user ID, then run `zeroclaw onboard --ch
                         .post(self.api_url("sendChatAction"))
                         .json(&typing_body)
                         .send()
-                        .await; // Ignore errors for typing indicator
+                        .await;
+
+                    // Extract content and attachments from all media types
+                    let (content, attachments) = self.extract_message_content(message).await;
+
+                    // Skip updates with no usable content
+                    if content.is_empty() && attachments.is_empty() {
+                        continue;
+                    }
 
                     let msg = ChannelMessage {
                         id: Uuid::new_v4().to_string(),
                         sender: chat_id,
-                        content: text.to_string(),
+                        content,
                         channel: "telegram".to_string(),
                         timestamp: std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
+                        attachments,
                     };
 
                     if tx.send(msg).await.is_err() {
                         return Ok(());
                     }
+                    // --- end ZeroClaw fork ---
                 }
             }
         }
+    }
+
+    async fn start_typing(&self, recipient: &str) -> anyhow::Result<()> {
+        let body = serde_json::json!({
+            "chat_id": recipient,
+            "action": "typing"
+        });
+        self.client
+            .post(self.api_url("sendChatAction"))
+            .json(&body)
+            .send()
+            .await?;
+        Ok(())
     }
 
     async fn health_check(&self) -> bool {

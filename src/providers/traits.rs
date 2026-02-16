@@ -1,11 +1,63 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+// --- ZeroClaw fork: multimodal content support for vision models ---
+
+/// Type of content within a multimodal message part.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum ContentPartType {
+    Text,
+    Image,
+}
+
+/// A single part of a multimodal message (text or image).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContentPart {
+    pub content_type: ContentPartType,
+    /// Text content (when content_type == Text).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Base64-encoded image data (when content_type == Image).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_base64: Option<String>,
+    /// MIME type of the image (e.g. "image/jpeg", "image/png").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+}
+
+impl ContentPart {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            content_type: ContentPartType::Text,
+            text: Some(text.into()),
+            image_base64: None,
+            mime_type: None,
+        }
+    }
+
+    pub fn image(base64_data: impl Into<String>, mime: impl Into<String>) -> Self {
+        Self {
+            content_type: ContentPartType::Image,
+            text: None,
+            image_base64: Some(base64_data.into()),
+            mime_type: Some(mime.into()),
+        }
+    }
+}
+
+// --- end ZeroClaw fork ---
+
 /// A single message in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    // --- ZeroClaw fork: multimodal content parts for vision models ---
+    /// When Some, providers should serialize as a content array instead of
+    /// a plain string. When None, use `content` field (backward-compatible).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parts: Option<Vec<ContentPart>>,
+    // --- end ZeroClaw fork ---
 }
 
 impl ChatMessage {
@@ -13,6 +65,7 @@ impl ChatMessage {
         Self {
             role: "system".into(),
             content: content.into(),
+            parts: None,
         }
     }
 
@@ -20,6 +73,7 @@ impl ChatMessage {
         Self {
             role: "user".into(),
             content: content.into(),
+            parts: None,
         }
     }
 
@@ -27,8 +81,35 @@ impl ChatMessage {
         Self {
             role: "assistant".into(),
             content: content.into(),
+            parts: None,
         }
     }
+
+    // --- ZeroClaw fork ---
+    /// Create a user message with both text and an image for vision models.
+    pub fn with_image(
+        text: impl Into<String>,
+        image_base64: impl Into<String>,
+        mime_type: impl Into<String>,
+    ) -> Self {
+        let text_str: String = text.into();
+        Self {
+            role: "user".into(),
+            content: text_str.clone(),
+            parts: Some(vec![
+                ContentPart::text(text_str),
+                ContentPart::image(image_base64, mime_type),
+            ]),
+        }
+    }
+
+    /// Whether this message contains image content for vision models.
+    pub fn has_images(&self) -> bool {
+        self.parts
+            .as_ref()
+            .map_or(false, |p| p.iter().any(|c| c.content_type == ContentPartType::Image))
+    }
+    // --- end ZeroClaw fork ---
 }
 
 /// A tool call requested by the LLM.

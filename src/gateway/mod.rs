@@ -42,7 +42,7 @@ use uuid::Uuid;
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
 /// Request timeout (300s) — allows agent loop with tool execution
-pub const REQUEST_TIMEOUT_SECS: u64 = 300;
+pub const REQUEST_TIMEOUT_SECS: u64 = 3600;
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
@@ -605,28 +605,18 @@ async fn handle_webhook(
             .await;
     }
 
-    // ── Model selection: manual override → auto-route → default ──
-    // Check if this conversation already has prior exchanges (assistant messages).
-    // If so, follow-ups must stay on the primary model for context continuity.
-    let has_prior_exchange = state
-        .conversations
-        .get(sender_id)
-        .map_or(false, |history| {
-            history.iter().any(|m| m.role == "assistant")
-        });
-
-    let selected_model = if let Some(ref m) = webhook_body.model {
-        m.clone()
-    } else {
-        crate::agent::routing::select_model_hint(message, has_prior_exchange)
-            .map(String::from)
-            .unwrap_or_else(|| state.model.clone())
-    };
+    // ── Model selection: manual override or default ──
+    // Auto-routing between models is disabled — keyword-based classification
+    // is too fragile and misroutes tool-use tasks to models that can't handle
+    // them. All messages use the primary model unless explicitly overridden.
+    let selected_model = webhook_body
+        .model
+        .clone()
+        .unwrap_or_else(|| state.model.clone());
 
     tracing::info!(
         sender = sender_id.as_str(),
         model = selected_model.as_str(),
-        auto_routed = webhook_body.model.is_none(),
         "Webhook model selection"
     );
 
@@ -952,8 +942,8 @@ mod tests {
     }
 
     #[test]
-    fn security_timeout_is_300_seconds() {
-        assert_eq!(REQUEST_TIMEOUT_SECS, 300);
+    fn security_timeout_is_3600_seconds() {
+        assert_eq!(REQUEST_TIMEOUT_SECS, 3600);
     }
 
     #[test]
@@ -1018,6 +1008,7 @@ mod tests {
             content: "hello".into(),
             channel: "whatsapp".into(),
             timestamp: 1,
+            attachments: vec![],
         };
 
         let key = whatsapp_memory_key(&msg);

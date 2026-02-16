@@ -205,19 +205,12 @@ impl SecurityPolicy {
             let args: Vec<String> = words.map(|w| w.to_ascii_lowercase()).collect();
             let joined_segment = cmd_part.to_ascii_lowercase();
 
-            // High-risk commands
+            // High-risk commands (destructive / privilege-escalating / raw network)
             if matches!(
                 base.as_str(),
                 "rm" | "mkfs"
                     | "dd"
-                    | "shutdown"
-                    | "reboot"
-                    | "halt"
-                    | "poweroff"
-                    | "sudo"
                     | "su"
-                    | "chown"
-                    | "chmod"
                     | "useradd"
                     | "userdel"
                     | "usermod"
@@ -227,13 +220,9 @@ impl SecurityPolicy {
                     | "iptables"
                     | "ufw"
                     | "firewall-cmd"
-                    | "curl"
-                    | "wget"
                     | "nc"
                     | "ncat"
                     | "netcat"
-                    | "scp"
-                    | "ssh"
                     | "ftp"
                     | "telnet"
             ) {
@@ -278,7 +267,9 @@ impl SecurityPolicy {
                         "add" | "remove" | "install" | "clean" | "publish"
                     )
                 }),
-                "touch" | "mkdir" | "mv" | "cp" | "ln" => true,
+                "touch" | "mkdir" | "mv" | "cp" | "ln"
+                | "curl" | "wget" | "ssh" | "scp" | "sudo"
+                | "chmod" | "chown" | "rsync" => true,
                 _ => false,
             };
 
@@ -827,6 +818,26 @@ mod tests {
         assert!(!SecurityPolicy::is_catastrophic("sudo ls"));
         assert!(!SecurityPolicy::is_catastrophic("curl https://example.com"));
         assert!(!SecurityPolicy::is_catastrophic("chmod 755 script.sh"));
+    }
+
+    #[test]
+    fn reclassified_commands_are_medium_not_high() {
+        let p = SecurityPolicy {
+            allowed_commands: vec![
+                "curl".into(), "wget".into(), "ssh".into(), "scp".into(),
+                "sudo".into(), "chmod".into(), "chown".into(), "rsync".into(),
+            ],
+            ..SecurityPolicy::default()
+        };
+        for cmd in &["curl https://example.com", "wget https://example.com",
+                      "ssh user@host", "scp file user@host:", "sudo ls",
+                      "chmod 755 script.sh", "chown user file", "rsync -av src/ dst/"] {
+            assert_eq!(
+                p.command_risk_level(cmd),
+                CommandRiskLevel::Medium,
+                "Expected Medium for: {cmd}"
+            );
+        }
     }
 
     // ── is_path_allowed ─────────────────────────────────────

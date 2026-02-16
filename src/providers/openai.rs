@@ -15,11 +15,13 @@ struct ChatRequest {
     temperature: f64,
 }
 
+// --- ZeroClaw fork: support multimodal content for vision ---
 #[derive(Debug, Serialize)]
 struct Message {
     role: String,
-    content: String,
+    content: serde_json::Value,
 }
+// --- end ZeroClaw fork ---
 
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
@@ -41,7 +43,7 @@ impl OpenAiProvider {
         Self {
             api_key: api_key.map(ToString::to_string),
             client: Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
+                .timeout(std::time::Duration::from_secs(600))
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
@@ -67,13 +69,13 @@ impl Provider for OpenAiProvider {
         if let Some(sys) = system_prompt {
             messages.push(Message {
                 role: "system".to_string(),
-                content: sys.to_string(),
+                content: serde_json::Value::String(sys.to_string()),
             });
         }
 
         messages.push(Message {
             role: "user".to_string(),
-            content: message.to_string(),
+            content: serde_json::Value::String(message.to_string()),
         });
 
         let request = ChatRequest {
@@ -151,11 +153,11 @@ mod tests {
             messages: vec![
                 Message {
                     role: "system".to_string(),
-                    content: "You are ZeroClaw".to_string(),
+                    content: serde_json::Value::String("You are ZeroClaw".to_string()),
                 },
                 Message {
                     role: "user".to_string(),
-                    content: "hello".to_string(),
+                    content: serde_json::Value::String("hello".to_string()),
                 },
             ],
             temperature: 0.7,
@@ -172,7 +174,7 @@ mod tests {
             model: "gpt-4o".to_string(),
             messages: vec![Message {
                 role: "user".to_string(),
-                content: "hello".to_string(),
+                content: serde_json::Value::String("hello".to_string()),
             }],
             temperature: 0.0,
         };

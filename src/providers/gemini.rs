@@ -70,10 +70,24 @@ struct Content {
     parts: Vec<Part>,
 }
 
+// --- ZeroClaw fork: support multimodal parts for vision ---
 #[derive(Debug, Serialize)]
-struct Part {
-    text: String,
+#[serde(untagged)]
+enum Part {
+    Text { text: String },
+    InlineData {
+        #[serde(rename = "inlineData")]
+        inline_data: InlineData,
+    },
 }
+
+#[derive(Debug, Serialize)]
+struct InlineData {
+    #[serde(rename = "mimeType")]
+    mime_type: String,
+    data: String,
+}
+// --- end ZeroClaw fork ---
 
 #[derive(Debug, Serialize)]
 struct GenerationConfig {
@@ -138,7 +152,7 @@ impl GeminiProvider {
         Self {
             auth: resolved_auth,
             client: Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
+                .timeout(std::time::Duration::from_secs(600))
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
@@ -274,7 +288,7 @@ impl Provider for GeminiProvider {
         // Build request
         let system_instruction = system_prompt.map(|sys| Content {
             role: None,
-            parts: vec![Part {
+            parts: vec![Part::Text {
                 text: sys.to_string(),
             }],
         });
@@ -282,7 +296,7 @@ impl Provider for GeminiProvider {
         let request = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".to_string()),
-                parts: vec![Part {
+                parts: vec![Part::Text {
                     text: message.to_string(),
                 }],
             }],
@@ -321,6 +335,95 @@ impl Provider for GeminiProvider {
             .and_then(|p| p.text)
             .ok_or_else(|| anyhow::anyhow!("No response from Gemini"))
     }
+
+    // --- ZeroClaw fork: multimodal chat_with_history for vision ---
+    async fn chat_with_history(
+        &self,
+        messages: &[crate::providers::traits::ChatMessage],
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<String> {
+        use crate::providers::traits::ContentPartType;
+
+        let auth = self.auth.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Gemini API key not found.")
+        })?;
+
+        // Extract system prompt
+        let system_instruction = messages
+            .iter()
+            .find(|m| m.role == "system")
+            .map(|m| Content {
+                role: None,
+                parts: vec![Part::Text { text: m.content.clone() }],
+            });
+
+        // Convert non-system messages to Gemini contents
+        let contents: Vec<Content> = messages
+            .iter()
+            .filter(|m| m.role != "system")
+            .map(|m| {
+                let role = if m.role == "assistant" { "model" } else { &m.role };
+                let parts = if let Some(ref content_parts) = m.parts {
+                    content_parts
+                        .iter()
+                        .map(|p| match p.content_type {
+                            ContentPartType::Text => Part::Text {
+                                text: p.text.clone().unwrap_or_default(),
+                            },
+                            ContentPartType::Image => Part::InlineData {
+                                inline_data: InlineData {
+                                    mime_type: p.mime_type.clone().unwrap_or_else(|| "image/jpeg".into()),
+                                    data: p.image_base64.clone().unwrap_or_default(),
+                                },
+                            },
+                        })
+                        .collect()
+                } else {
+                    vec![Part::Text { text: m.content.clone() }]
+                };
+                Content {
+                    role: Some(role.to_string()),
+                    parts,
+                }
+            })
+            .collect();
+
+        let request = GenerateContentRequest {
+            contents,
+            system_instruction,
+            generation_config: GenerationConfig {
+                temperature,
+                max_output_tokens: 8192,
+            },
+        };
+
+        let url = Self::build_generate_content_url(model, auth);
+        let response = self
+            .build_generate_content_request(auth, &url, &request)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Gemini API error ({status}): {error_text}");
+        }
+
+        let result: GenerateContentResponse = response.json().await?;
+
+        if let Some(err) = result.error {
+            anyhow::bail!("Gemini API error: {}", err.message);
+        }
+
+        result
+            .candidates
+            .and_then(|c| c.into_iter().next())
+            .and_then(|c| c.content.parts.into_iter().next())
+            .and_then(|p| p.text)
+            .ok_or_else(|| anyhow::anyhow!("No response from Gemini"))
+    }
+    // --- end ZeroClaw fork ---
 }
 
 #[cfg(test)]
@@ -435,7 +538,7 @@ mod tests {
         let body = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".into()),
-                parts: vec![Part {
+                parts: vec![Part::Text {
                     text: "hello".into(),
                 }],
             }],
@@ -471,7 +574,7 @@ mod tests {
         let body = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".into()),
-                parts: vec![Part {
+                parts: vec![Part::Text {
                     text: "hello".into(),
                 }],
             }],
@@ -495,13 +598,13 @@ mod tests {
         let request = GenerateContentRequest {
             contents: vec![Content {
                 role: Some("user".to_string()),
-                parts: vec![Part {
+                parts: vec![Part::Text {
                     text: "Hello".to_string(),
                 }],
             }],
             system_instruction: Some(Content {
                 role: None,
-                parts: vec![Part {
+                parts: vec![Part::Text {
                     text: "You are helpful".to_string(),
                 }],
             }),

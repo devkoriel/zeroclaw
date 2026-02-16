@@ -111,9 +111,6 @@ fn is_technical_task(message: &str) -> bool {
         "send a message", "send the message", "send message",
         "send a mail", "send the mail", "send an email", "send email",
         "send it to", "send this to", "send to my",
-        "open the app", "open an app", "open app",
-        "launch the app", "launch app",
-        "close the app", "close app", "quit the app", "quit app",
         "take a screenshot", "take screenshot", "capture screen",
         "click on", "click the", "right click", "double click",
         "type in", "type into",
@@ -124,6 +121,21 @@ fn is_technical_task(message: &str) -> bool {
     ];
     for action in SYSTEM_ACTIONS {
         if lower.contains(action) {
+            return true;
+        }
+    }
+
+    // Desktop app interaction verbs — "open/launch/close/quit" followed by anything
+    // implies tool use (computer tool). Match the verb prefix generously since
+    // the object can be any app name ("open the elgato stream deck application").
+    const APP_VERBS: &[&str] = &[
+        "open the ", "open a ", "open my ",
+        "launch the ", "launch a ", "launch my ",
+        "close the ", "close a ", "close my ",
+        "quit the ", "quit a ", "quit my ",
+    ];
+    for verb in APP_VERBS {
+        if lower.contains(verb) {
             return true;
         }
     }
@@ -566,6 +578,42 @@ mod tests {
         assert_eq!(
             select_model_hint("fix the bug in main.rs", true),
             None
+        );
+    }
+
+    // ── App interaction → Claude (requires computer tool) ──
+
+    #[test]
+    fn technical_open_app_by_name() {
+        // "open the <app name>" must route to Claude — requires computer tool
+        assert_eq!(
+            select_model_hint("Open the elgato stream deck application", false),
+            None
+        );
+        assert_eq!(
+            select_model_hint("open the settings", false),
+            None
+        );
+        assert_eq!(
+            select_model_hint("launch the terminal", false),
+            None
+        );
+        assert_eq!(
+            select_model_hint("close the browser", false),
+            None
+        );
+        assert_eq!(
+            select_model_hint("quit the music app", false),
+            None
+        );
+    }
+
+    #[test]
+    fn general_open_question_not_misrouted() {
+        // "open" as adjective/noun should NOT trigger app detection
+        assert_eq!(
+            select_model_hint("what are some open problems in physics?", false),
+            Some("hint:fast")
         );
     }
 

@@ -6,6 +6,7 @@ APP="/Applications/ZeroClaw.app"
 BIN="${APP}/Contents/MacOS/zeroclaw"
 PLIST="$HOME/Library/LaunchAgents/com.zeroclaw.daemon.plist"
 SERVICE="com.zeroclaw.daemon"
+SIGN_IDENTITY="ZeroClaw Development"
 UID_VAL=$(id -u)
 
 echo "🔨 Building release..."
@@ -18,8 +19,15 @@ sleep 1
 echo "📦 Copying binary to app bundle..."
 cp target/release/zeroclaw "${BIN}"
 
-echo "🔏 Code signing..."
-codesign --force --deep --sign - "${APP}"
+echo "🔏 Code signing (identity: ${SIGN_IDENTITY})..."
+if security find-identity -v -p codesigning | grep -q "${SIGN_IDENTITY}"; then
+    codesign --force --deep --sign "${SIGN_IDENTITY}" --identifier "${SERVICE}" "${APP}"
+else
+    echo "⚠️  Certificate '${SIGN_IDENTITY}' not found — falling back to ad-hoc signing"
+    echo "   macOS permissions (Screen Recording, Accessibility) will reset on each rebuild."
+    echo "   Run: scripts/setup-cert.sh to create a persistent signing certificate."
+    codesign --force --deep --sign - --identifier "${SERVICE}" "${APP}"
+fi
 
 echo "▶️  Starting daemon..."
 launchctl bootstrap "gui/${UID_VAL}" "${PLIST}"

@@ -21,7 +21,9 @@ pub use telegram::TelegramChannel;
 pub use traits::Channel;
 pub use whatsapp::WhatsAppChannel;
 
-use crate::agent::loop_::{agent_turn, build_tool_instructions};
+use crate::agent::loop_::{
+    agent_turn, auto_compact_history, build_tool_instructions, trim_history, trim_history_by_size,
+};
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
@@ -32,6 +34,7 @@ use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
+use dashmap::DashMap;
 use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::Arc;
@@ -42,7 +45,7 @@ const BOOTSTRAP_MAX_CHARS: usize = 20_000;
 
 const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;
 const DEFAULT_CHANNEL_MAX_BACKOFF_SECS: u64 = 60;
-const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 90;
+const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 3600;
 const CHANNEL_PARALLELISM_PER_CHANNEL: usize = 4;
 const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
 const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
@@ -58,6 +61,9 @@ struct ChannelRuntimeContext {
     model: Arc<String>,
     temperature: f64,
     auto_save_memory: bool,
+    // --- ZeroClaw fork: per-user conversation history for multi-turn context ---
+    conversations: Arc<DashMap<String, Vec<ChatMessage>>>,
+    // --- end ZeroClaw fork ---
 }
 
 fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
@@ -79,6 +85,66 @@ async fn build_memory_context(mem: &dyn Memory, user_msg: &str) -> String {
 
     context
 }
+
+// --- ZeroClaw fork: multimodal message construction from media attachments ---
+
+/// Build a `ChatMessage` from text and any media attachments.
+///
+/// - Image attachments (Photo, Sticker, Animation): reads the downloaded file,
+///   base64-encodes it, and returns `ChatMessage::with_image()` for vision models.
+/// - File-based media (Voice, Audio, Video, Document, VideoNote): appends a
+///   bracketed description to the text so the agent knows a file is available.
+/// - Structured data (Location, Contact, Poll, Venue): already described in
+///   `content` text by `extract_message_content`, so passed as-is.
+fn build_user_message_from_attachments(
+    text: &str,
+    attachments: &[traits::MediaAttachment],
+) -> ChatMessage {
+    // Find the first image attachment with a downloaded file
+    let image_attachment = attachments.iter().find(|a| {
+        a.media_type.is_image() && a.file_path.is_some()
+    });
+
+    if let Some(img) = image_attachment {
+        if let Some(ref path) = img.file_path {
+            if let Ok(bytes) = std::fs::read(path) {
+                use base64::Engine;
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                let mime = img.mime_type.as_deref().unwrap_or("image/jpeg");
+
+                // Include caption/text + any non-image attachment descriptions
+                let mut full_text = text.to_string();
+                for att in attachments {
+                    if !att.media_type.is_image() && att.media_type.is_file() {
+                        if let Some(ref fp) = att.file_path {
+                            let _ = write!(
+                                &mut full_text,
+                                "\n[Attached {}: {}]",
+                                att.media_type, fp
+                            );
+                        }
+                    }
+                }
+
+                return ChatMessage::with_image(full_text, b64, mime);
+            }
+        }
+    }
+
+    // No image attachment — append file descriptions to text
+    let mut full_text = text.to_string();
+    for att in attachments {
+        if att.media_type.is_file() {
+            if let Some(ref fp) = att.file_path {
+                let _ = write!(&mut full_text, "\n[Attached {}: {}]", att.media_type, fp);
+            }
+        }
+    }
+
+    ChatMessage::user(full_text)
+}
+
+// --- end ZeroClaw fork ---
 
 fn spawn_supervised_listener(
     ch: Arc<dyn Channel>,
@@ -157,27 +223,53 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             .await;
     }
 
-    let enriched_message = if memory_context.is_empty() {
-        msg.content.clone()
-    } else {
-        format!("{memory_context}{}", msg.content)
+    // --- ZeroClaw fork: channel-aware enrichment matching gateway behavior ---
+    let channel_hint = match msg.channel.as_str() {
+        "telegram" => "[Platform: Telegram] The user is chatting with you via Telegram. You ARE the Telegram bot — never suggest \"sending via Telegram\" or ask for bot tokens. Use standard Markdown in your response; the system converts it to Telegram HTML automatically.\n\n",
+        "discord" => "[Platform: Discord] The user is chatting with you via Discord. You ARE the Discord bot.\n\n",
+        _ => "",
     };
+    let enriched_message = format!("{channel_hint}{memory_context}{}", msg.content);
+    // --- end ZeroClaw fork ---
 
     let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
-
-    if let Some(channel) = target_channel.as_ref() {
-        if let Err(e) = channel.start_typing(&msg.sender).await {
-            tracing::debug!("Failed to start typing on {}: {e}", channel.name());
-        }
-    }
 
     println!("  ⏳ Processing message...");
     let started_at = Instant::now();
 
-    let mut history = vec![
-        ChatMessage::system(ctx.system_prompt.as_str()),
-        ChatMessage::user(&enriched_message),
-    ];
+    // --- ZeroClaw fork: persistent per-user conversation history ---
+    // Sender key combines channel + user so each channel user has their own history.
+    let sender_key = format!("{}_{}", msg.channel, msg.sender);
+
+    let mut history = ctx
+        .conversations
+        .entry(sender_key.clone())
+        .or_insert_with(|| vec![ChatMessage::system(ctx.system_prompt.as_str())])
+        .value()
+        .clone();
+
+    // Build multimodal ChatMessage for image attachments
+    let user_message = build_user_message_from_attachments(&enriched_message, &msg.attachments);
+    history.push(user_message);
+    // --- end ZeroClaw fork ---
+
+    // Spawn a repeating typing indicator that fires every 5s until the agent
+    // turn completes. Telegram typing indicators expire after ~5s so we must
+    // keep re-sending for long-running tasks (computer use, multi-step tools).
+    let (typing_stop_tx, mut typing_stop_rx) = tokio::sync::watch::channel(false);
+    if let Some(channel) = target_channel.as_ref() {
+        let ch = Arc::clone(channel);
+        let recipient = msg.sender.clone();
+        tokio::spawn(async move {
+            loop {
+                let _ = ch.start_typing(&recipient).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    _ = typing_stop_rx.changed() => break,
+                }
+            }
+        });
+    }
 
     let llm_result = tokio::time::timeout(
         Duration::from_secs(CHANNEL_MESSAGE_TIMEOUT_SECS),
@@ -192,11 +284,19 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
     )
     .await;
 
-    if let Some(channel) = target_channel.as_ref() {
-        if let Err(e) = channel.stop_typing(&msg.sender).await {
-            tracing::debug!("Failed to stop typing on {}: {e}", channel.name());
-        }
-    }
+    // Stop the typing indicator
+    let _ = typing_stop_tx.send(true);
+
+    // --- ZeroClaw fork: persist history after agent turn, with trimming ---
+    let save_history = |history: &mut Vec<ChatMessage>, ctx: &ChannelRuntimeContext, sender_key: &str| {
+        trim_history(history);
+        trim_history_by_size(history);
+        let subject = crate::agent::routing::extract_subject(history);
+        let history_json = serde_json::to_string(&history).unwrap_or_default();
+        ctx.conversations.insert(sender_key.to_string(), history.clone());
+        (history_json, subject)
+    };
+    // --- end ZeroClaw fork ---
 
     match llm_result {
         Ok(Ok(response)) => {
@@ -205,6 +305,25 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 started_at.elapsed().as_millis(),
                 truncate_with_ellipsis(&response, 80)
             );
+
+            // --- ZeroClaw fork: compact + trim + persist conversation ---
+            let _ = auto_compact_history(
+                &mut history,
+                ctx.provider.as_ref(),
+                ctx.model.as_str(),
+            )
+            .await;
+            let (history_json, subject) = save_history(&mut history, &ctx, &sender_key);
+            let _ = ctx
+                .memory
+                .save_conversation(&sender_key, &history_json, subject.as_deref())
+                .await;
+            // --- end ZeroClaw fork ---
+
+            // Channel-specific formatting is handled by each channel's send() method
+            // (e.g. Telegram's send() calls markdown_to_telegram_html internally).
+            // Do NOT convert here — that would double-convert and escape HTML tags.
+
             if let Some(channel) = target_channel.as_ref() {
                 if let Err(e) = channel.send(&response, &msg.sender).await {
                     eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
@@ -212,10 +331,26 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
             }
         }
         Ok(Err(e)) => {
+            let err_str = e.to_string();
             eprintln!(
-                "  ❌ LLM error after {}ms: {e}",
+                "  ❌ LLM error after {}ms: {err_str}",
                 started_at.elapsed().as_millis()
             );
+
+            // Context-length errors: reset history so next message works
+            if err_str.contains("prompt is too long")
+                || err_str.contains("too many tokens")
+                || err_str.contains("context_length_exceeded")
+            {
+                history.truncate(1); // keep system prompt only
+            }
+
+            let (history_json, subject) = save_history(&mut history, &ctx, &sender_key);
+            let _ = ctx
+                .memory
+                .save_conversation(&sender_key, &history_json, subject.as_deref())
+                .await;
+
             if let Some(channel) = target_channel.as_ref() {
                 let _ = channel.send(&format!("⚠️ Error: {e}"), &msg.sender).await;
             }
@@ -230,6 +365,13 @@ async fn process_channel_message(ctx: Arc<ChannelRuntimeContext>, msg: traits::C
                 timeout_msg,
                 started_at.elapsed().as_millis()
             );
+
+            let (history_json, subject) = save_history(&mut history, &ctx, &sender_key);
+            let _ = ctx
+                .memory
+                .save_conversation(&sender_key, &history_json, subject.as_deref())
+                .await;
+
             if let Some(channel) = target_channel.as_ref() {
                 let _ = channel
                     .send(
@@ -353,10 +495,9 @@ pub fn build_system_prompt(
          - Prefer `trash` over `rm` (recoverable beats gone forever).\n\
          - When in doubt, ask before acting externally.\n\n\
          ## Language\n\n\
-         - Always respond in **English** by default.\n\
-         - If the user explicitly requests a different language (e.g. \"answer in Korean\", \
-         \"한국어로 답해줘\", \"日本語で答えて\"), respond in that language for that exchange.\n\
-         - Revert to English on the next message unless told otherwise.\n\n",
+         - **Auto-detect**: Respond in the same language the user writes in.\n\
+         - If the user writes in Korean, reply in Korean. If in Japanese, reply in Japanese. Etc.\n\
+         - If the language is unclear or mixed, default to English.\n\n",
     );
 
     // ── 2b. Capabilities ───────────────────────────────────────────
@@ -397,9 +538,9 @@ pub fn build_system_prompt(
          - Click a text field before typing into it\n\
          - Use `osascript` in shell tool for specific macOS app integration (Mail, Calendar, etc.)\n\n\
          Risk tiers:\n\
-         - **Low-risk** (ls, cat, echo, pwd): execute immediately\n\
-         - **Medium/High-risk** (rm, sudo, curl, install): ask user first (APPROVAL_REQUIRED)\n\
-         - **Catastrophic** (rm -rf /, fork bombs, dd to /dev): permanently blocked\n\n\
+         - **Low-risk** (ls, cat, echo, pwd, curl, wget, ssh, chmod, sudo): execute immediately\n\
+         - **High-risk** (rm, dd, mkfs, nc, iptables, useradd): ask user first (APPROVAL_REQUIRED)\n\
+         - **Catastrophic** (rm -rf /, fork bombs, dd to /dev, shutdown): permanently blocked\n\n\
          You are NOT sandboxed to a workspace directory.\n\n",
     );
 
@@ -434,7 +575,9 @@ pub fn build_system_prompt(
             );
 
             let high_risk: &[&str] = &[
-                "rm", "sudo", "chmod", "chown", "curl", "wget", "ssh", "scp",
+                "rm", "dd", "mkfs", "nc", "ncat", "netcat", "iptables", "ufw",
+                "useradd", "userdel", "usermod", "passwd", "mount", "umount",
+                "ftp", "telnet", "su", "firewall-cmd",
             ];
             for cmd in &autonomy.allowed_commands {
                 let note = if high_risk.contains(&cmd.as_str()) {
@@ -451,6 +594,31 @@ pub fn build_system_prompt(
             );
         }
     }
+
+    // ── 2f. Self-Healing Protocol ──────────────────────────────
+    prompt.push_str("## Self-Healing Protocol\n\n");
+    prompt.push_str(
+        "You are a **self-healing, self-modifying** agent. When something fails:\n\n\
+         1. **Diagnose**: Read logs, check process status, identify root cause.\n\
+         2. **Fix**: Apply the minimal change to restore functionality.\n\
+         3. **Verify**: Confirm the fix worked (check logs, re-run, test).\n\
+         4. **Report**: Tell the user what broke and what you did.\n\n\
+         ### Recovery Patterns\n\n\
+         - **Daemon not running**: `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.zeroclaw.daemon.plist`\n\
+         - **Build failure**: Read compiler errors, fix code, rebuild.\n\
+         - **Permission denied**: Check TCC permissions, re-sign app if needed.\n\
+         - **API key expired/missing**: Check `~/.zeroclaw/config.toml`, alert user.\n\
+         - **Dependency missing**: Install via brew/cargo/pip.\n\n\
+         ### Self-Modification\n\n\
+         - Use `self_upgrade` tool to pull latest code, build, deploy, and restart.\n\
+         - For config changes, edit `~/.zeroclaw/config.toml` directly.\n\
+         - After self-upgrade, the daemon restarts automatically — your response may be the last before restart.\n\n\
+         ### Health Monitoring\n\n\
+         - Check daemon status: `launchctl print gui/$(id -u)/com.zeroclaw.daemon`\n\
+         - Check logs: `log show --predicate 'process == \"zeroclaw\"' --last 5m`\n\
+         - Check disk: `df -h /`\n\
+         - Check memory: `vm_stat`\n\n",
+    );
 
     // ── 3. Skills (compact list — load on-demand) ───────────────
     if !skills.is_empty() {
@@ -1055,6 +1223,34 @@ pub async fn start_channels(config: Config) -> Result<()> {
 
     println!("  🚦 In-flight message limit: {max_in_flight_messages}");
 
+    // --- ZeroClaw fork: restore persisted conversations for continuity across restarts ---
+    let conversations: Arc<DashMap<String, Vec<ChatMessage>>> = Arc::new(DashMap::new());
+    match mem.load_all_conversations().await {
+        Ok(stored) => {
+            for (sender_id, history_json) in stored {
+                if let Ok(mut hist) = serde_json::from_str::<Vec<ChatMessage>>(&history_json) {
+                    // Replace stale system prompt with current one
+                    if hist.first().map_or(false, |m| m.role == "system") {
+                        hist[0] = ChatMessage::system(&system_prompt);
+                    }
+                    trim_history(&mut hist);
+                    trim_history_by_size(&mut hist);
+                    conversations.insert(sender_id, hist);
+                }
+            }
+            if !conversations.is_empty() {
+                tracing::info!(
+                    "Channel runtime: restored {} persisted conversation(s)",
+                    conversations.len()
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!("Failed to load persisted conversations: {e}");
+        }
+    }
+    // --- end ZeroClaw fork ---
+
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
         provider: Arc::clone(&provider),
@@ -1065,6 +1261,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         model: Arc::new(model.clone()),
         temperature,
         auto_save_memory: config.memory.auto_save,
+        conversations,
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -1259,6 +1456,7 @@ mod tests {
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            conversations: Arc::new(DashMap::new()),
         });
 
         process_channel_message(
@@ -1269,6 +1467,7 @@ mod tests {
                 content: "What is the BTC price now?".to_string(),
                 channel: "test-channel".to_string(),
                 timestamp: 1,
+                attachments: vec![],
             },
         )
         .await;
@@ -1349,6 +1548,7 @@ mod tests {
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
             auto_save_memory: false,
+            conversations: Arc::new(DashMap::new()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -1358,6 +1558,7 @@ mod tests {
             content: "hello".to_string(),
             channel: "test-channel".to_string(),
             timestamp: 1,
+            attachments: vec![],
         })
         .await
         .unwrap();
@@ -1367,6 +1568,7 @@ mod tests {
             content: "world".to_string(),
             channel: "test-channel".to_string(),
             timestamp: 2,
+            attachments: vec![],
         })
         .await
         .unwrap();
@@ -1610,6 +1812,7 @@ mod tests {
             content: "hello".into(),
             channel: "slack".into(),
             timestamp: 1,
+            attachments: vec![],
         };
 
         assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
@@ -1623,6 +1826,7 @@ mod tests {
             content: "first".into(),
             channel: "slack".into(),
             timestamp: 1,
+            attachments: vec![],
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -1630,6 +1834,7 @@ mod tests {
             content: "second".into(),
             channel: "slack".into(),
             timestamp: 2,
+            attachments: vec![],
         };
 
         assert_ne!(
@@ -1649,6 +1854,7 @@ mod tests {
             content: "I'm Paul".into(),
             channel: "slack".into(),
             timestamp: 1,
+            attachments: vec![],
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -1656,6 +1862,7 @@ mod tests {
             content: "I'm 45".into(),
             channel: "slack".into(),
             timestamp: 2,
+            attachments: vec![],
         };
 
         mem.store(

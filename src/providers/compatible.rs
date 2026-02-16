@@ -37,7 +37,7 @@ impl OpenAiCompatibleProvider {
             api_key: api_key.map(ToString::to_string),
             auth_header: auth_style,
             client: Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
+                .timeout(std::time::Duration::from_secs(600))
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
@@ -85,11 +85,43 @@ struct ChatRequest {
     temperature: f64,
 }
 
+// --- ZeroClaw fork: support multimodal content for vision ---
 #[derive(Debug, Serialize)]
 struct Message {
     role: String,
-    content: String,
+    content: serde_json::Value,
 }
+
+impl Message {
+    fn from_chat_message(m: &crate::providers::traits::ChatMessage) -> Self {
+        let content = if let Some(ref parts) = m.parts {
+            let content_parts: Vec<serde_json::Value> = parts
+                .iter()
+                .map(|p| match p.content_type {
+                    crate::providers::traits::ContentPartType::Text => {
+                        serde_json::json!({"type": "text", "text": p.text.as_deref().unwrap_or("")})
+                    }
+                    crate::providers::traits::ContentPartType::Image => {
+                        let mime = p.mime_type.as_deref().unwrap_or("image/jpeg");
+                        let data = p.image_base64.as_deref().unwrap_or("");
+                        serde_json::json!({
+                            "type": "image_url",
+                            "image_url": {"url": format!("data:{mime};base64,{data}")}
+                        })
+                    }
+                })
+                .collect();
+            serde_json::Value::Array(content_parts)
+        } else {
+            serde_json::Value::String(m.content.clone())
+        };
+        Self {
+            role: m.role.clone(),
+            content,
+        }
+    }
+}
+// --- end ZeroClaw fork ---
 
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
@@ -266,13 +298,13 @@ impl Provider for OpenAiCompatibleProvider {
         if let Some(sys) = system_prompt {
             messages.push(Message {
                 role: "system".to_string(),
-                content: sys.to_string(),
+                content: serde_json::Value::String(sys.to_string()),
             });
         }
 
         messages.push(Message {
             role: "user".to_string(),
-            content: message.to_string(),
+            content: serde_json::Value::String(message.to_string()),
         });
 
         let request = ChatRequest {
@@ -346,12 +378,10 @@ impl Provider for OpenAiCompatibleProvider {
             )
         })?;
 
+        // --- ZeroClaw fork: use from_chat_message for vision support ---
         let api_messages: Vec<Message> = messages
             .iter()
-            .map(|m| Message {
-                role: m.role.clone(),
-                content: m.content.clone(),
-            })
+            .map(Message::from_chat_message)
             .collect();
 
         let request = ChatRequest {
@@ -469,11 +499,11 @@ mod tests {
             messages: vec![
                 Message {
                     role: "system".to_string(),
-                    content: "You are ZeroClaw".to_string(),
+                    content: serde_json::Value::String("You are ZeroClaw".to_string()),
                 },
                 Message {
                     role: "user".to_string(),
-                    content: "hello".to_string(),
+                    content: serde_json::Value::String("hello".to_string()),
                 },
             ],
             temperature: 0.7,

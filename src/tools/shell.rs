@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Maximum shell command execution time before kill.
-const SHELL_TIMEOUT_SECS: u64 = 60;
+const SHELL_TIMEOUT_SECS: u64 = 1800;
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
 /// Environment variables safe to pass to shell commands.
