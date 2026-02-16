@@ -16,11 +16,11 @@ impl SelfUpgradeTool {
     }
 
     /// Derive the repository root from the running binary's location.
-    /// Falls back to the current working directory.
+    /// When deployed as an app bundle, the binary is NOT inside the repo,
+    /// so we check well-known paths and $HOME/Development/zeroclaw as fallbacks.
     fn detect_repo_dir() -> PathBuf {
+        // 1. Walk up from binary location (works when running from target/release/)
         if let Ok(exe) = std::env::current_exe() {
-            // Binary is typically at <repo>/target/release/zeroclaw
-            // Walk up looking for a .git directory.
             let mut dir = exe.as_path();
             while let Some(parent) = dir.parent() {
                 if parent.join(".git").is_dir() {
@@ -29,6 +29,16 @@ impl SelfUpgradeTool {
                 dir = parent;
             }
         }
+
+        // 2. Check $HOME/Development/zeroclaw (canonical location)
+        if let Ok(home) = std::env::var("HOME") {
+            let candidate = PathBuf::from(&home).join("Development/zeroclaw");
+            if candidate.join(".git").is_dir() {
+                return candidate;
+            }
+        }
+
+        // 3. Last resort: current directory
         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     }
 
