@@ -1,130 +1,186 @@
-//! Automatic model routing based on task complexity.
+//! Automatic model routing based on task domain.
 //!
-//! Classifies incoming messages as simple or complex to route them to the
-//! most cost-effective model. Simple conversational queries go to the fast
-//! model (e.g. Gemini), while complex tasks requiring tool use, code generation,
-//! or multi-step reasoning stay on the primary model (e.g. Claude Opus).
+//! Classifies incoming messages as **technical** (coding, programming, DevOps,
+//! system administration) or **general** (conversation, Q&A, creative, casual).
+//!
+//! Technical tasks → Claude Opus (primary model) — best-in-class for coding,
+//! tool use, agentic reasoning, and long-context code analysis.
+//!
+//! General tasks → Gemini (fast model) — fast, cheap, great for conversation,
+//! Q&A, creative writing, summarization, and general knowledge.
 
-/// Decide which model string to pass to the provider for a given user message.
+/// Decide which model hint to use for the given user message.
 ///
-/// Returns `Some("hint:fast")` for simple tasks that can be handled by the
-/// fast/cheap model, or `None` to use the default (most capable) model.
+/// Returns `Some("hint:fast")` for general/non-technical tasks (→ Gemini),
+/// or `None` for technical tasks (→ Claude Opus, the default primary model).
 ///
-/// When `has_prior_exchange` is true (the conversation already has assistant
-/// messages), the primary model is always used to maintain context continuity.
-/// Only brand-new conversations with simple messages are routed to the fast model.
+/// Each message is classified independently so that switching between general
+/// chat and technical work within the same conversation routes to the right
+/// model. The shared conversation history provides context continuity
+/// regardless of which model handles a particular turn.
+///
+/// **Exception**: Short approval/denial responses ("yes", "ok", "go ahead")
+/// in active conversations always go to the primary model, since they may
+/// be answering a tool-approval prompt from Claude.
 pub fn select_model_hint(message: &str, has_prior_exchange: bool) -> Option<&'static str> {
-    // If there's been a prior exchange in this conversation, always use the
-    // primary model. Short follow-ups like "temp", "yes", "that one" are
-    // context-dependent answers that the fast model can't handle without
-    // the full conversation history and tool-use capabilities.
-    if has_prior_exchange {
-        return None; // always use primary model for follow-ups
+    let lower = message.to_ascii_lowercase();
+
+    // Short approval/denial responses in active conversations stay on primary
+    // model — they're likely answering a tool-approval or action-confirmation
+    // prompt that Claude issued. Without conversation tracking we can't know
+    // which model asked, so we play it safe.
+    if has_prior_exchange && is_approval_response(&lower) {
+        return None;
     }
 
-    if is_complex_task(message) {
-        None // use default (Claude Opus)
-    } else {
-        Some("hint:fast") // route to Gemini
+    // Technical / coding / programming / DevOps → Claude Opus
+    if is_technical_task(message) {
+        return None;
     }
+
+    // Everything else → Gemini (general conversation, Q&A, creative, etc.)
+    Some("hint:fast")
 }
 
-/// Heuristic complexity classifier. Returns `true` if the message likely
-/// requires deep reasoning, tool use, or multi-step execution.
-fn is_complex_task(message: &str) -> bool {
+/// Returns `true` if the message is about coding, programming, technical
+/// operations, or requires tool use / system interaction.
+///
+/// This is intentionally strict: only clearly technical messages go to
+/// Claude Opus. General-purpose "write", "create", "summarize" requests
+/// that aren't about code go to Gemini since it handles them well and
+/// is much cheaper.
+fn is_technical_task(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    let len = message.len();
 
-    // Long messages are usually complex requests
-    if len > 300 {
+    // ── Direct code indicators ──
+
+    // Code blocks or inline code
+    if message.contains("```") || message.contains("` ") {
         return true;
     }
 
-    // Code blocks or file paths signal technical tasks
-    if message.contains("```") || message.contains("~/") || message.contains("/usr/") {
-        return true;
-    }
-
-    // Error messages / stack traces
-    if lower.contains("error:") || lower.contains("traceback") || lower.contains("panic at") {
-        return true;
-    }
-
-    // Approval responses should stay on same model that asked
-    if is_approval_response(&lower) {
-        return true;
-    }
-
-    // Tool-use / action signals
-    const ACTION_SIGNALS: &[&str] = &[
-        "create ", "write ", "build ", "deploy ", "install ",
-        "configure ", "fix ", "debug ", "implement ", "refactor ",
-        "delete ", "remove ", "run ", "execute ", "compile ",
-        "test ", "update ", "upgrade ", "migrate ", "restart ",
-        "start ", "stop ", "kill ", "mkdir ", "touch ",
-        "commit ", "push ", "pull ", "merge ", "rebase ",
-        "ssh ", "scp ", "curl ", "wget ", "docker ",
-        "chmod ", "chown ", "sudo ",
-        "read the file", "open the file", "edit the file",
-        "read my ", "read email", "read mail", "check my ",
-        "send email", "send mail", "send a message",
-        "show me the", "list the files", "check the",
-        "make a", "set up", "set the",
-        "add a", "add the",
-        "search for", "find my ", "download ", "upload ",
-        "schedule ", "remind me", "summarize ", "analyze ",
-    ];
-
-    for signal in ACTION_SIGNALS {
-        if lower.contains(signal) {
-            return true;
-        }
-    }
-
-    // Multi-step patterns
-    if lower.contains("step 1")
-        || lower.contains("first,")
-        || lower.contains("then ")
-        || lower.contains("after that")
-        || lower.contains("and then")
-        || lower.contains("finally ")
+    // File paths
+    if message.contains("~/") || message.contains("/usr/") || message.contains("/etc/")
+        || message.contains("/var/") || message.contains("/tmp/")
+        || message.contains("C:\\") || message.contains(".rs")
+        || message.contains(".py") || message.contains(".ts")
+        || message.contains(".js") || message.contains(".go")
+        || message.contains(".sol") || message.contains(".toml")
+        || message.contains(".yaml") || message.contains(".yml")
+        || message.contains(".json") || message.contains(".env")
+        || message.contains(".sh") || message.contains(".tf")
     {
         return true;
     }
 
-    // Numbered lists (1. ... 2. ...)
-    if lower.contains("\n1.") || lower.contains("\n2.") {
+    // Error messages / stack traces
+    if lower.contains("error:") || lower.contains("traceback")
+        || lower.contains("panic at") || lower.contains("stack trace")
+        || lower.contains("segfault") || lower.contains("exception")
+        || lower.contains("compile error") || lower.contains("build failed")
+        || lower.contains("syntax error") || lower.contains("type error")
+    {
         return true;
     }
 
-    // Technical keywords that imply complex reasoning
-    const COMPLEX_KEYWORDS: &[&str] = &[
-        "architecture", "refactor", "optimize", "performance",
-        "security", "vulnerability", "database", "schema",
-        "terraform", "kubernetes", "docker", "helm",
-        "api endpoint", "middleware", "authentication",
-        "race condition", "deadlock", "memory leak",
-        "cicd", "ci/cd", "pipeline", "workflow",
-        // System integration tasks requiring tool use
-        "email", "calendar", "notification", "reminder",
-        "screenshot", "clipboard", "desktop", "application",
-        "browser", "safari", "chrome", "firefox",
-        "important", "missed", "unread",
-        "自動", "실행", // CJK action words
+    // ── Shell / DevOps commands ──
+    const SHELL_SIGNALS: &[&str] = &[
+        "ssh ", "scp ", "curl ", "wget ", "docker ",
+        "kubectl ", "helm ", "terraform ",
+        "cargo ", "rustc ", "npm ", "pnpm ", "yarn ",
+        "pip ", "pip3 ", "python3 ", "node ",
+        "git ", "make ", "cmake ", "gcc ", "g++ ",
+        "chmod ", "chown ", "sudo ", "systemctl ",
+        "launchctl ", "brew ",
     ];
+    for cmd in SHELL_SIGNALS {
+        if lower.contains(cmd) {
+            return true;
+        }
+    }
 
-    for keyword in COMPLEX_KEYWORDS {
+    // ── Programming / technical action verbs ──
+    // These specifically relate to code/system operations, NOT general actions
+    const TECH_ACTIONS: &[&str] = &[
+        "debug ", "deploy ", "compile ", "refactor ",
+        "implement ", "migrate ", "rebase ",
+        "commit ", "push ", "merge ",
+        "fix the bug", "fix this bug", "fix the error", "fix this error",
+        "fix the code", "fix this code",
+        "read the file", "edit the file", "open the file",
+        "create a file", "create the file", "delete the file",
+        "list the files", "check the logs",
+        "run the test", "run tests", "run cargo", "run npm",
+        "build the", "build this",
+    ];
+    for action in TECH_ACTIONS {
+        if lower.contains(action) {
+            return true;
+        }
+    }
+
+    // ── Technical domain keywords ──
+    const TECH_KEYWORDS: &[&str] = &[
+        // Programming concepts
+        "function", "variable", "class ", "struct ", "enum ",
+        "interface ", "trait ", "generic", "async ", "await ",
+        "callback", "closure", "iterator", "pointer", "reference",
+        "mutex", "semaphore", "thread", "goroutine", "coroutine",
+        // Architecture & systems
+        "architecture", "microservice", "monolith", "api endpoint",
+        "middleware", "load balancer", "reverse proxy",
+        "database", "schema", "migration", "query", "index ",
+        "cache", "redis", "postgres", "mysql", "mongodb",
+        // DevOps & infrastructure
+        "kubernetes", "k8s", "docker", "container",
+        "terraform", "ansible", "helm", "argocd",
+        "ci/cd", "cicd", "pipeline", "github actions",
+        "aws ", "gcp ", "azure ",
+        // Security & networking
+        "vulnerability", "authentication", "authorization",
+        "ssl", "tls", "certificate", "firewall",
+        "race condition", "deadlock", "memory leak",
+        "buffer overflow", "injection",
+        // Code quality
+        "refactor", "optimize", "performance", "benchmark",
+        "test coverage", "unit test", "integration test",
+        "linter", "clippy", "eslint", "prettier",
+        // Specific technologies
+        "react", "nextjs", "next.js", "vue", "angular",
+        "express", "fastapi", "django", "flask",
+        "rust ", "golang", "typescript", "solidity",
+        "smart contract", "blockchain", "web3",
+        "oracle", "scribe", "chronicle",
+    ];
+    for keyword in TECH_KEYWORDS {
         if lower.contains(keyword) {
             return true;
         }
     }
 
-    // Otherwise, it's likely a simple conversational query → Gemini
+    // ── Code-like patterns ──
+
+    // Contains typical code symbols in combination
+    if (lower.contains("()") || lower.contains("{}") || lower.contains("[]"))
+        && (lower.contains("fn ") || lower.contains("def ") || lower.contains("func ")
+            || lower.contains("class ") || lower.contains("const ")
+            || lower.contains("let ") || lower.contains("var "))
+    {
+        return true;
+    }
+
+    // CJK technical action words
+    if lower.contains("코드") || lower.contains("프로그") || lower.contains("개발")  // Korean: code, program, develop
+        || lower.contains("コード") || lower.contains("プログラム") // Japanese: code, program
+        || lower.contains("代码") || lower.contains("程序") || lower.contains("编程") // Chinese: code, program, programming
+    {
+        return true;
+    }
+
     false
 }
 
 /// Check if the message is an approval/denial response to a permission request.
-/// These must stay on the same model (Claude) that generated the approval request.
 fn is_approval_response(lower: &str) -> bool {
     let trimmed = lower.trim();
     matches!(
@@ -210,17 +266,17 @@ pub fn extract_subject(messages: &[crate::providers::ChatMessage]) -> Option<Str
 mod tests {
     use super::*;
 
-    // ── Simple tasks → hint:fast ──
+    // ── General tasks → hint:fast (Gemini) ──
 
     #[test]
-    fn simple_greeting() {
+    fn general_greeting() {
         assert_eq!(select_model_hint("hello", false), Some("hint:fast"));
         assert_eq!(select_model_hint("hi there", false), Some("hint:fast"));
         assert_eq!(select_model_hint("good morning", false), Some("hint:fast"));
     }
 
     #[test]
-    fn simple_factual_question() {
+    fn general_factual_question() {
         assert_eq!(
             select_model_hint("what is the capital of France?", false),
             Some("hint:fast")
@@ -232,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn simple_short_question() {
+    fn general_casual_chat() {
         assert_eq!(
             select_model_hint("how are you?", false),
             Some("hint:fast")
@@ -243,26 +299,68 @@ mod tests {
         );
     }
 
-    // ── Complex tasks → None (default Claude) ──
-
     #[test]
-    fn complex_file_operation() {
+    fn general_creative_writing() {
+        // "write me a poem" is creative, NOT technical → Gemini
         assert_eq!(
-            select_model_hint("create a new file called utils.rs with helper functions", false),
-            None
+            select_model_hint("write me a haiku about autumn", false),
+            Some("hint:fast")
+        );
+        assert_eq!(
+            select_model_hint("tell me a joke", false),
+            Some("hint:fast")
+        );
+        assert_eq!(
+            select_model_hint("write a short story about a cat", false),
+            Some("hint:fast")
         );
     }
 
     #[test]
-    fn complex_shell_command() {
+    fn general_summarization() {
         assert_eq!(
-            select_model_hint("run cargo test to check if everything passes", false),
-            None
+            select_model_hint("summarize the French Revolution", false),
+            Some("hint:fast")
         );
     }
 
     #[test]
-    fn complex_code_block() {
+    fn general_translation() {
+        assert_eq!(
+            select_model_hint("translate hello world to Korean", false),
+            Some("hint:fast")
+        );
+    }
+
+    #[test]
+    fn general_recommendation() {
+        assert_eq!(
+            select_model_hint("recommend a good book about history", false),
+            Some("hint:fast")
+        );
+    }
+
+    #[test]
+    fn general_long_non_technical() {
+        // Long but clearly non-technical → Gemini
+        assert_eq!(
+            select_model_hint(
+                "I'm planning a trip to Japan next month and wondering about the best places to visit in Tokyo. What are some must-see attractions?",
+                false
+            ),
+            Some("hint:fast")
+        );
+    }
+
+    #[test]
+    fn general_empty_message() {
+        assert_eq!(select_model_hint("", false), Some("hint:fast"));
+    }
+
+    // ── Technical tasks → None (Claude Opus) ──
+
+    #[test]
+    fn technical_code_block() {
         assert_eq!(
             select_model_hint("fix this code:\n```rust\nfn main() { panic!() }\n```", false),
             None
@@ -270,7 +368,15 @@ mod tests {
     }
 
     #[test]
-    fn complex_error_message() {
+    fn technical_file_path() {
+        assert_eq!(
+            select_model_hint("check ~/Development/zeroclaw/src/main.rs", false),
+            None
+        );
+    }
+
+    #[test]
+    fn technical_error_message() {
         assert_eq!(
             select_model_hint("I got this error: thread 'main' panicked at 'index out of bounds'", false),
             None
@@ -278,21 +384,15 @@ mod tests {
     }
 
     #[test]
-    fn complex_multi_step() {
+    fn technical_shell_command() {
         assert_eq!(
-            select_model_hint("first, read the config file, then update the port to 8080", false),
+            select_model_hint("run cargo test to check if everything passes", false),
             None
         );
     }
 
     #[test]
-    fn complex_long_message() {
-        let long = "a".repeat(301);
-        assert_eq!(select_model_hint(&long, false), None);
-    }
-
-    #[test]
-    fn complex_deployment() {
+    fn technical_deployment() {
         assert_eq!(
             select_model_hint("deploy the latest build to the staging kubernetes cluster", false),
             None
@@ -300,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn complex_debugging() {
+    fn technical_debugging() {
         assert_eq!(
             select_model_hint("debug why the API endpoint returns 500", false),
             None
@@ -308,87 +408,113 @@ mod tests {
     }
 
     #[test]
-    fn complex_file_path() {
+    fn technical_file_operations() {
         assert_eq!(
-            select_model_hint("check ~/Development/zeroclaw/src/main.rs", false),
-            None
-        );
-    }
-
-    // ── Approval responses → None (stay on Claude) ──
-
-    #[test]
-    fn approval_yes() {
-        assert_eq!(select_model_hint("yes", false), None);
-        assert_eq!(select_model_hint("Yes", false), None);
-        assert_eq!(select_model_hint("y", false), None);
-        assert_eq!(select_model_hint("go ahead", false), None);
-        assert_eq!(select_model_hint("approved", false), None);
-    }
-
-    #[test]
-    fn approval_no() {
-        assert_eq!(select_model_hint("no", false), None);
-        assert_eq!(select_model_hint("cancel", false), None);
-        assert_eq!(select_model_hint("stop", false), None);
-    }
-
-    // ── Edge cases ──
-
-    #[test]
-    fn empty_message() {
-        // Empty is not complex
-        assert_eq!(select_model_hint("", false), Some("hint:fast"));
-    }
-
-    #[test]
-    fn borderline_action_in_question() {
-        // "write" appears → complex
-        assert_eq!(
-            select_model_hint("write me a haiku about rust", false),
+            select_model_hint("create a file called utils.rs with helper functions", false),
             None
         );
     }
 
     #[test]
-    fn technical_keyword_triggers_complex() {
+    fn technical_docker() {
         assert_eq!(
-            select_model_hint("explain the security implications", false),
-            None
-        );
-        assert_eq!(
-            select_model_hint("how does the authentication work?", false),
+            select_model_hint("set up docker compose for the project", false),
             None
         );
     }
 
-    // ── Follow-up messages in active conversations → None (primary model) ──
-
     #[test]
-    fn followup_short_answer_uses_primary_model() {
-        // "temp" would normally route to fast model, but in an active
-        // conversation it's a follow-up answer and must use primary model.
-        assert_eq!(select_model_hint("temp", true), None);
-        assert_eq!(select_model_hint("that one", true), None);
-        assert_eq!(select_model_hint("the first option", true), None);
+    fn technical_git_operations() {
+        assert_eq!(
+            select_model_hint("commit and push these changes", false),
+            None
+        );
     }
 
     #[test]
-    fn followup_simple_greeting_uses_primary_model() {
-        // Even greetings should stay on primary in an active conversation
-        assert_eq!(select_model_hint("hello", true), None);
-        assert_eq!(select_model_hint("thanks!", true), None);
+    fn technical_code_concept() {
+        assert_eq!(
+            select_model_hint("explain how async functions work in Rust", false),
+            None
+        );
     }
 
     #[test]
-    fn followup_empty_uses_primary_model() {
-        assert_eq!(select_model_hint("", true), None);
+    fn technical_database() {
+        assert_eq!(
+            select_model_hint("how do I add an index to the users table?", false),
+            None
+        );
     }
 
     #[test]
-    fn followup_complex_still_uses_primary_model() {
-        // Complex messages in follow-ups also stay on primary (no change)
-        assert_eq!(select_model_hint("create a file called test.rs", true), None);
+    fn technical_security() {
+        assert_eq!(
+            select_model_hint("check for vulnerability in the auth module", false),
+            None
+        );
+    }
+
+    #[test]
+    fn technical_file_extension() {
+        assert_eq!(
+            select_model_hint("read config.toml and update the port", false),
+            None
+        );
+    }
+
+    #[test]
+    fn technical_cjk_code() {
+        // Korean: "코드를 수정해주세요" = "Please fix the code"
+        assert_eq!(
+            select_model_hint("코드를 수정해주세요", false),
+            None
+        );
+    }
+
+    // ── Approval responses ──
+
+    #[test]
+    fn approval_in_conversation_stays_primary() {
+        // In active conversation, approval goes to Claude (may be tool approval)
+        assert_eq!(select_model_hint("yes", true), None);
+        assert_eq!(select_model_hint("go ahead", true), None);
+        assert_eq!(select_model_hint("cancel", true), None);
+    }
+
+    #[test]
+    fn approval_first_message_goes_to_gemini() {
+        // First message "yes" with no context → just a word, route to Gemini
+        assert_eq!(select_model_hint("yes", false), Some("hint:fast"));
+        assert_eq!(select_model_hint("ok", false), Some("hint:fast"));
+    }
+
+    // ── Follow-up routing (per-message, not locked) ──
+
+    #[test]
+    fn followup_general_goes_to_gemini() {
+        // In active conversation, general questions still go to Gemini
+        assert_eq!(
+            select_model_hint("what's the weather like?", true),
+            Some("hint:fast")
+        );
+        assert_eq!(
+            select_model_hint("tell me about cats", true),
+            Some("hint:fast")
+        );
+    }
+
+    #[test]
+    fn followup_technical_goes_to_claude() {
+        // In active conversation, technical still goes to Claude
+        assert_eq!(
+            select_model_hint("now deploy it to kubernetes", true),
+            None
+        );
+        assert_eq!(
+            select_model_hint("fix the bug in main.rs", true),
+            None
+        );
     }
 
     // ── Subject extraction ──
