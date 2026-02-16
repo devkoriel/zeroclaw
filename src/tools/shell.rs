@@ -132,6 +132,7 @@ impl Tool for ShellTool {
                     vec![]
                 } else {
                     let mut dirs = vec![
+                        format!("{home}/.asdf/shims"),
                         format!("{home}/.cargo/bin"),
                         format!("{home}/.local/bin"),
                     ];

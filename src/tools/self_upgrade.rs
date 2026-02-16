@@ -172,8 +172,11 @@ impl Tool for SelfUpgradeTool {
         };
 
         let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/koriel".into());
-        // Build PATH with cargo/rustup toolchain discovery
-        let mut path_parts: Vec<String> = vec![format!("{home}/.cargo/bin")];
+        // Build PATH with asdf/cargo/rustup toolchain discovery
+        let mut path_parts: Vec<String> = vec![
+            format!("{home}/.asdf/shims"),
+            format!("{home}/.cargo/bin"),
+        ];
         // Discover rustup toolchain bin dirs (cargo may live here)
         let rustup_toolchains = format!("{home}/.rustup/toolchains");
         if let Ok(entries) = std::fs::read_dir(&rustup_toolchains) {
