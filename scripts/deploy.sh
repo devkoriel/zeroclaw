@@ -2,6 +2,9 @@
 # Deploy ZeroClaw: build → copy to .app → sign → restart daemon
 set -euo pipefail
 
+# Ensure cargo is in PATH (rustup may not be in default PATH)
+export PATH="$HOME/.rustup/toolchains/stable-aarch64-apple-darwin/bin:$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
 APP="/Applications/ZeroClaw.app"
 BIN="${APP}/Contents/MacOS/zeroclaw"
 PLIST="$HOME/Library/LaunchAgents/com.zeroclaw.daemon.plist"

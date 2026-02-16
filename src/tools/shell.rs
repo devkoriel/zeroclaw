@@ -125,13 +125,23 @@ impl Tool for ShellTool {
                 // Prepend common tool directories so Homebrew etc. are reachable
                 // even when the daemon inherits minimal PATH from launchd.
                 let base = std::env::var("PATH").unwrap_or_default();
+                let home = std::env::var("HOME").unwrap_or_default();
                 let mut full_path = String::new();
-                for dir in EXTRA_PATH_DIRS {
-                    if std::path::Path::new(dir).is_dir() {
+                // Static dirs + dynamic HOME-relative dirs (cargo, rustup)
+                let home_dirs: Vec<String> = if home.is_empty() {
+                    vec![]
+                } else {
+                    vec![
+                        format!("{home}/.cargo/bin"),
+                        format!("{home}/.local/bin"),
+                    ]
+                };
+                for dir in EXTRA_PATH_DIRS.iter().map(|s| s.to_string()).chain(home_dirs) {
+                    if std::path::Path::new(&dir).is_dir() {
                         if !full_path.is_empty() {
                             full_path.push(':');
                         }
-                        full_path.push_str(dir);
+                        full_path.push_str(&dir);
                     }
                 }
                 if !base.is_empty() {

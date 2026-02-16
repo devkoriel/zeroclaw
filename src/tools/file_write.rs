@@ -92,9 +92,10 @@ impl Tool for FileWriteTool {
             });
         }
 
-        // Determine full path: approved absolute paths are used directly,
-        // otherwise resolve relative to workspace.
-        let full_path = if approved && std::path::Path::new(path).is_absolute() {
+        // Determine full path: absolute paths are used directly when approved
+        // OR when workspace_only is disabled; otherwise resolve relative to workspace.
+        let is_abs = std::path::Path::new(path).is_absolute();
+        let full_path = if is_abs && (approved || !self.security.workspace_only) {
             std::path::PathBuf::from(path)
         } else {
             self.security.workspace_dir.join(path)
@@ -123,8 +124,8 @@ impl Tool for FileWriteTool {
             }
         };
 
-        // Workspace containment check (skip when user-approved)
-        if !approved && !self.security.is_resolved_path_allowed(&resolved_parent) {
+        // Workspace containment check (skip when user-approved or workspace_only is disabled)
+        if !approved && self.security.workspace_only && !self.security.is_resolved_path_allowed(&resolved_parent) {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),

@@ -89,6 +89,9 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     println!("   Components: gateway, channels, heartbeat, scheduler");
     println!("   Ctrl+C to stop");
 
+    // Send startup notification to configured Telegram channels
+    send_startup_notification(&config).await;
+
     tokio::signal::ctrl_c().await?;
     crate::health::mark_component_error("daemon", "shutdown requested");
 
@@ -100,6 +103,60 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Send a "I'm back" notification to all allowed Telegram users on daemon startup.
+async fn send_startup_notification(config: &Config) {
+    let Some(ref tg_config) = config.channels_config.telegram else {
+        return;
+    };
+
+    let bot_token = &tg_config.bot_token;
+    if bot_token.is_empty() {
+        return;
+    }
+
+    let now = Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+    let version = env!("CARGO_PKG_VERSION");
+    let message = format!(
+        "🦀 <b>ZeroClaw is back online!</b>\n\n\
+         ✅ Daemon restarted successfully\n\
+         📦 Version: {version}\n\
+         🕐 {now}\n\n\
+         All systems operational. Ready to assist."
+    );
+
+    let client = reqwest::Client::new();
+    let url = format!("https://api.telegram.org/bot{bot_token}/sendMessage");
+
+    for user_id in &tg_config.allowed_users {
+        // Skip wildcard entries
+        if user_id == "*" {
+            continue;
+        }
+
+        let body = serde_json::json!({
+            "chat_id": user_id,
+            "text": message,
+            "parse_mode": "HTML"
+        });
+
+        match client.post(&url).json(&body).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::info!("Startup notification sent to Telegram user {user_id}");
+            }
+            Ok(resp) => {
+                let status = resp.status();
+                let err = resp.text().await.unwrap_or_default();
+                tracing::warn!(
+                    "Failed to send startup notification to {user_id}: {status} — {err}"
+                );
+            }
+            Err(e) => {
+                tracing::warn!("Failed to send startup notification to {user_id}: {e}");
+            }
+        }
+    }
 }
 
 pub fn state_file_path(config: &Config) -> PathBuf {

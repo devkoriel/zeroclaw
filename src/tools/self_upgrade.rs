@@ -59,7 +59,9 @@ impl Tool for SelfUpgradeTool {
     fn description(&self) -> &str {
         "Check for and apply ZeroClaw updates from the git repository. \
          Use check_only=true (default) to see pending changes; \
-         set check_only=false with approved=true to pull and rebuild."
+         set check_only=false with approved=true to pull, build, deploy, and restart. \
+         Alternatively, use the shell tool to run `bash scripts/deploy.sh` from the repo root \
+         to rebuild and redeploy without pulling."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -159,103 +161,117 @@ impl Tool for SelfUpgradeTool {
         }
 
         // Pull changes
-        match self.run_git(&["pull", "origin", "main"]) {
-            Ok(pull_output) => {
-                // Build release binary
-                let build = Command::new("cargo")
-                    .args(["build", "--release"])
-                    .current_dir(&self.repo_dir)
-                    .output();
-
-                match build {
-                    Ok(output) if output.status.success() => {
-                        // Auto-deploy: copy binary to app bundle and codesign
-                        let release_bin = self.repo_dir.join("target/release/zeroclaw");
-                        let app_bin = PathBuf::from("/Applications/ZeroClaw.app/Contents/MacOS/zeroclaw");
-                        let mut deploy_log = String::new();
-
-                        if let Err(e) = std::fs::copy(&release_bin, &app_bin) {
-                            return Ok(ToolResult {
-                                success: false,
-                                output: format!("Build succeeded but deploy failed ({current_sha} → {remote_sha})."),
-                                error: Some(format!("Failed to copy binary: {e}")),
-                            });
-                        }
-                        deploy_log.push_str("Binary copied to app bundle.\n");
-
-                        // Codesign with stable identity (fallback to ad-hoc)
-                        let sign_result = Command::new("codesign")
-                            .args(["--force", "--deep", "--sign", "ZeroClaw Development",
-                                   "--identifier", "com.zeroclaw.daemon",
-                                   "/Applications/ZeroClaw.app"])
-                            .output();
-                        match sign_result {
-                            Ok(s) if s.status.success() => {
-                                deploy_log.push_str("Signed with ZeroClaw Development certificate.\n");
-                            }
-                            _ => {
-                                let _ = Command::new("codesign")
-                                    .args(["--force", "--deep", "--sign", "-",
-                                           "--identifier", "com.zeroclaw.daemon",
-                                           "/Applications/ZeroClaw.app"])
-                                    .output();
-                                deploy_log.push_str("Signed with ad-hoc identity (no certificate found).\n");
-                            }
-                        }
-
-                        // Schedule daemon restart in a detached thread so this response
-                        // gets delivered before the process dies.
-                        std::thread::spawn(|| {
-                            std::thread::sleep(std::time::Duration::from_secs(3));
-                            let uid = Command::new("id").arg("-u").output()
-                                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                                .unwrap_or_else(|_| "501".into());
-                            let plist = format!(
-                                "{}/Library/LaunchAgents/com.zeroclaw.daemon.plist",
-                                std::env::var("HOME").unwrap_or_else(|_| "/Users/koriel".into())
-                            );
-                            let _ = Command::new("launchctl")
-                                .args(["bootout", &format!("gui/{uid}"), &plist])
-                                .output();
-                            std::thread::sleep(std::time::Duration::from_secs(1));
-                            let _ = Command::new("launchctl")
-                                .args(["bootstrap", &format!("gui/{uid}"), &plist])
-                                .output();
-                        });
-
-                        Ok(ToolResult {
-                            success: true,
-                            output: format!(
-                                "Upgrade & deploy complete ({current_sha} → {remote_sha}).\n\
-                                 Pull: {pull_output}\n\
-                                 Build: success\n\
-                                 {deploy_log}\n\
-                                 Daemon will restart in ~3 seconds."
-                            ),
-                            error: None,
-                        })
-                    }
-                    Ok(output) => {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        Ok(ToolResult {
-                            success: false,
-                            output: format!("Pull succeeded but build failed ({current_sha} → {remote_sha})."),
-                            error: Some(format!("cargo build --release failed:\n{stderr}")),
-                        })
-                    }
-                    Err(e) => Ok(ToolResult {
-                        success: false,
-                        output: format!("Pull succeeded but cargo not found ({current_sha} → {remote_sha})."),
-                        error: Some(format!("Failed to run cargo: {e}")),
-                    }),
-                }
+        let pull_output = match self.run_git(&["pull", "origin", "main"]) {
+            Ok(o) => o,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("git pull failed: {e}")),
+                });
             }
-            Err(e) => Ok(ToolResult {
+        };
+
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users/koriel".into());
+        let path_env = format!(
+            "{home}/.cargo/bin:/opt/homebrew/bin:/opt/homebrew/sbin:\
+             /usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        );
+
+        // Phase 1: Build
+        let build = Command::new("cargo")
+            .args(["build", "--release"])
+            .current_dir(&self.repo_dir)
+            .env("PATH", &path_env)
+            .env("HOME", &home)
+            .output();
+
+        let build_output = match build {
+            Ok(o) if o.status.success() => o,
+            Ok(o) => {
+                let stderr = String::from_utf8_lossy(&o.stderr);
+                return Ok(ToolResult {
+                    success: false,
+                    output: format!("Build failed ({current_sha} → {remote_sha})."),
+                    error: Some(format!("cargo build --release:\n{stderr}")),
+                });
+            }
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to run cargo: {e}")),
+                });
+            }
+        };
+        let build_stderr = String::from_utf8_lossy(&build_output.stderr);
+
+        // Phase 2: Copy binary to app bundle (daemon is still running old binary — this is safe)
+        let release_bin = self.repo_dir.join("target/release/zeroclaw");
+        let app_bin = "/Applications/ZeroClaw.app/Contents/MacOS/zeroclaw";
+        if let Err(e) = std::fs::copy(&release_bin, app_bin) {
+            return Ok(ToolResult {
                 success: false,
-                output: String::new(),
-                error: Some(format!("git pull failed: {e}")),
-            }),
+                output: "Build succeeded but copy failed.".into(),
+                error: Some(format!("cp to app bundle: {e}")),
+            });
         }
+
+        // Phase 3: Codesign (while daemon still runs the old in-memory binary)
+        let _ = Command::new("codesign")
+            .args([
+                "--force", "--deep",
+                "--sign", "ZeroClaw Development",
+                "--identifier", "com.zeroclaw.daemon",
+                "/Applications/ZeroClaw.app",
+            ])
+            .env("PATH", &path_env)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .or_else(|| {
+                Command::new("codesign")
+                    .args([
+                        "--force", "--deep", "--sign", "-",
+                        "--identifier", "com.zeroclaw.daemon",
+                        "/Applications/ZeroClaw.app",
+                    ])
+                    .output()
+                    .ok()
+            });
+
+        // Phase 4: Schedule restart via a DETACHED process that outlives this daemon.
+        // nohup + setsid ensures the restart script survives when bootout kills us.
+        let uid = Command::new("id").arg("-u").output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|_| "501".into());
+        let plist = format!("{home}/Library/LaunchAgents/com.zeroclaw.daemon.plist");
+
+        let restart_script = format!(
+            "sleep 3; launchctl bootout gui/{uid} '{plist}' 2>/dev/null; \
+             sleep 1; launchctl bootstrap gui/{uid} '{plist}'"
+        );
+        // Use nohup + bash -c in background so the restart outlives our process
+        let _ = Command::new("nohup")
+            .args(["bash", "-c", &restart_script])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null())
+            .spawn(); // spawn() returns immediately, doesn't wait
+
+        Ok(ToolResult {
+            success: true,
+            output: format!(
+                "Upgrade & deploy complete ({current_sha} → {remote_sha}).\n\
+                 Pull: {pull_output}\n\
+                 Build: success{}\n\
+                 Binary copied & signed. Daemon restarting in ~3s.\n\
+                 You'll receive a startup notification when I'm back.",
+                if build_stderr.is_empty() { String::new() }
+                else { format!("\n{build_stderr}") }
+            ),
+            error: None,
+        })
     }
 }
 

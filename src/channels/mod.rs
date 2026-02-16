@@ -609,10 +609,16 @@ pub fn build_system_prompt(
          - **Permission denied**: Check TCC permissions, re-sign app if needed.\n\
          - **API key expired/missing**: Check `~/.zeroclaw/config.toml`, alert user.\n\
          - **Dependency missing**: Install via brew/cargo/pip.\n\n\
-         ### Self-Modification\n\n\
-         - Use `self_upgrade` tool to pull latest code, build, deploy, and restart.\n\
+         ### Self-Modification & Redeployment\n\n\
+         **CRITICAL**: To redeploy yourself, you MUST use one of these two methods:\n\n\
+         **Method 1** (preferred): Use the `self_upgrade` tool with `check_only=false, approved=true`.\n\
+         It handles git pull → cargo build → copy → codesign → restart automatically.\n\n\
+         **Method 2**: Run via shell: `bash ~/Development/zeroclaw/scripts/deploy.sh`\n\n\
+         **NEVER run `launchctl bootout` or `launchctl unload` directly** — it kills you \
+         before the new binary is deployed, and you cannot recover. The `self_upgrade` tool \
+         and `deploy.sh` script handle the restart safely using detached processes.\n\n\
          - For config changes, edit `~/.zeroclaw/config.toml` directly.\n\
-         - After self-upgrade, the daemon restarts automatically — your response may be the last before restart.\n\n\
+         - After redeployment, you'll restart and send a Telegram notification automatically.\n\n\
          ### Health Monitoring\n\n\
          - Check daemon status: `launchctl print gui/$(id -u)/com.zeroclaw.daemon`\n\
          - Check logs: `log show --predicate 'process == \"zeroclaw\"' --last 5m`\n\

@@ -342,18 +342,12 @@ impl ComputerTool {
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(3);
 
-        // Use osascript for scrolling (cliclick doesn't support it)
-        let scroll_amount = match direction {
-            "up" | "left" => amount,
-            "down" | "right" => -amount,
-            _ => return err_result(format!("Invalid scroll direction: {direction}. Use up/down/left/right")),
-        };
-
-        let axis = if direction == "left" || direction == "right" {
-            "horizontal scroll"
-        } else {
-            "scroll"
-        };
+        // Validate direction
+        if !matches!(direction, "up" | "down" | "left" | "right") {
+            return err_result(format!(
+                "Invalid scroll direction: {direction}. Use up/down/left/right"
+            ));
+        }
 
         // Move cursor to position first if coordinates provided
         if let Ok((x, y)) = extract_coords(args) {
@@ -362,16 +356,68 @@ impl ComputerTool {
             }
         }
 
-        let script = format!(
-            "tell application \"System Events\" to {axis} by {scroll_amount}"
+        // Use JXA (JavaScript for Automation) + CoreGraphics for reliable scrolling.
+        // CGEventCreateScrollWheelEvent is the most reliable way to scroll on macOS.
+        // JXA is always available on macOS (unlike Python pyobjc which may not be installed).
+        let (scroll_y, scroll_x) = match direction {
+            "up" => (amount as i32, 0),
+            "down" => (-(amount as i32), 0),
+            "left" => (0, amount as i32),
+            "right" => (0, -(amount as i32)),
+            _ => unreachable!(),
+        };
+
+        // Write JXA script to temp file to avoid shell quoting issues with osascript -e
+        let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S%3f");
+        let script_path = format!("/tmp/zeroclaw_scroll_{ts}.js");
+        let jxa_content = format!(
+            "ObjC.import('CoreGraphics');
+             var e = $.CGEventCreateScrollWheelEvent(null, 0, 2, {scroll_y}, {scroll_x});
+             $.CGEventPost(0, e);
+"
         );
-        match run_cmd("osascript", &["-e", &script]).await {
+
+        if let Err(e) = tokio::fs::write(&script_path, &jxa_content).await {
+            return err_result(format!("Failed to write scroll script: {e}"));
+        }
+
+        let result = run_cmd("osascript", &["-l", "JavaScript", &script_path]).await;
+        let _ = tokio::fs::remove_file(&script_path).await;
+
+        match result {
             Ok(_) => ToolResult {
                 success: true,
                 output: format!("Scrolled {direction} by {amount}"),
                 error: None,
             },
-            Err(e) => err_result(format!("Scroll failed: {e}")),
+            Err(e) => {
+                // Fallback: AppleScript key codes (arrow keys — not true scrolling but
+                // works when CoreGraphics is unavailable)
+                let key_code = match direction {
+                    "up" => 126,   // up arrow
+                    "down" => 125, // down arrow
+                    "left" => 123, // left arrow
+                    "right" => 124, // right arrow
+                    _ => unreachable!(),
+                };
+                let mut script_parts = Vec::new();
+                for _ in 0..amount {
+                    script_parts.push(format!(
+                        "tell application \"System Events\" to key code {key_code}"
+                    ));
+                }
+                let fallback_script = script_parts.join("\n");
+                match run_cmd("osascript", &["-e", &fallback_script]).await {
+                    Ok(_) => ToolResult {
+                        success: true,
+                        output: format!("Scrolled {direction} by {amount} (fallback)"),
+                        error: None,
+                    },
+                    Err(e2) => err_result(format!(
+                        "Scroll failed. Primary (JXA CoreGraphics): {e}. Fallback (osascript): {e2}"
+                    )),
+                }
+            }
         }
     }
 
@@ -579,26 +625,33 @@ async fn check_cliclick() -> Result<(), String> {
     }
 }
 
-/// Get logical screen width via Python `AppKit`, with `system_profiler` fallback.
+/// Get logical screen width via JXA `AppKit`, with `system_profiler` fallback.
 async fn get_logical_screen_width() -> Option<u32> {
-    // Method 1: Python AppKit (fast, reliable)
-    if let Ok(out) = run_cmd(
-        "python3",
-        &[
-            "-c",
-            "from AppKit import NSScreen; f=NSScreen.mainScreen().frame(); print(int(f.size.width))",
-        ],
+    // Method 1: JXA (JavaScript for Automation) + AppKit — always available on macOS.
+    // Unlike Python pyobjc, JXA doesn't require any extra packages.
+    let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S%3f");
+    let script_path = format!("/tmp/zeroclaw_screenw_{ts}.js");
+
+    if tokio::fs::write(
+        &script_path,
+        "ObjC.import('AppKit');\nvar f = $.NSScreen.mainScreen.frame;\nf.size.width;\n",
     )
     .await
+    .is_ok()
     {
-        if let Ok(w) = out.trim().parse::<u32>() {
-            if w > 0 {
-                return Some(w);
+        if let Ok(out) = run_cmd("osascript", &["-l", "JavaScript", &script_path]).await {
+            let _ = tokio::fs::remove_file(&script_path).await;
+            if let Ok(w) = out.trim().parse::<u32>() {
+                if w > 0 {
+                    return Some(w);
+                }
             }
+        } else {
+            let _ = tokio::fs::remove_file(&script_path).await;
         }
     }
 
-    // Method 2: system_profiler fallback
+    // Method 2: system_profiler fallback (slower but doesn't need any frameworks)
     if let Ok(out) = run_cmd("system_profiler", &["SPDisplaysDataType"]).await {
         // Look for "Resolution: 1512 x 982" (logical) or "3024 x 1964" (physical)
         // The "UI Looks like" line gives logical resolution on newer macOS
