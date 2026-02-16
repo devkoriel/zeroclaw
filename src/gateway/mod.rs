@@ -243,6 +243,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         mem.clone(),
         composio_key,
         &config.browser,
+        &config.http_request,
         &config.agents,
         config.api_key.as_deref(),
     ));
