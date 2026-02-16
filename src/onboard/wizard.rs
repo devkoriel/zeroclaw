@@ -106,6 +106,7 @@ pub fn run_wizard() -> Result<Config> {
         secrets: secrets_config,
         browser: BrowserConfig::default(),
         identity: crate::config::IdentityConfig::default(),
+        agents: std::collections::HashMap::new(),
     };
 
     println!(
@@ -297,6 +298,7 @@ pub fn run_quick_setup(
         secrets: SecretsConfig::default(),
         browser: BrowserConfig::default(),
         identity: crate::config::IdentityConfig::default(),
+        agents: std::collections::HashMap::new(),
     };
 
     config.save()?;
@@ -404,7 +406,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "groq" => "llama-3.3-70b-versatile".into(),
         "deepseek" => "deepseek-chat".into(),
         "gemini" | "google" | "google-gemini" => "gemini-2.0-flash".into(),
-        _ => "anthropic/claude-sonnet-4-20250514".into(),
+        _ => "anthropic/claude-sonnet-4".into(),
     }
 }
 
@@ -687,7 +689,7 @@ fn setup_provider() -> Result<(String, String, String)> {
     let models: Vec<(&str, &str)> = match provider_name {
         "openrouter" => vec![
             (
-                "anthropic/claude-sonnet-4-20250514",
+                "anthropic/claude-sonnet-4",
                 "Claude Sonnet 4 (balanced, recommended)",
             ),
             (
@@ -1124,6 +1126,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
         whatsapp: None,
         email: None,
         irc: None,
+        lark: None,
     };
 
     loop {
@@ -1375,6 +1378,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     bot_token: token,
                     guild_id: if guild.is_empty() { None } else { Some(guild) },
                     allowed_users,
+                    listen_to_bots: false,
                 });
             }
             2 => {

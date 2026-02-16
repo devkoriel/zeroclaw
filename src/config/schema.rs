@@ -2,6 +2,7 @@ use crate::security::AutonomyLevel;
 use anyhow::{Context, Result};
 use directories::UserDirs;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -63,6 +64,22 @@ pub struct Config {
 
     #[serde(default)]
     pub identity: IdentityConfig,
+
+    /// Named delegate agents for agent-to-agent handoff.
+    ///
+    /// ```toml
+    /// [agents.researcher]
+    /// provider = "gemini"
+    /// model = "gemini-2.0-flash"
+    /// system_prompt = "You are a research assistant..."
+    ///
+    /// [agents.coder]
+    /// provider = "openrouter"
+    /// model = "anthropic/claude-sonnet-4-20250514"
+    /// system_prompt = "You are a coding assistant..."
+    /// ```
+    #[serde(default)]
+    pub agents: HashMap<String, DelegateAgentConfig>,
 }
 
 // ── Identity (AIEOS / OpenClaw format) ──────────────────────────
@@ -92,6 +109,36 @@ impl Default for IdentityConfig {
             aieos_inline: None,
         }
     }
+}
+
+// ── Agent delegation ─────────────────────────────────────────────
+
+/// Configuration for a named delegate agent that can be invoked via the
+/// `delegate` tool. Each agent uses its own provider/model combination
+/// and system prompt, enabling multi-agent workflows with specialization.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DelegateAgentConfig {
+    /// Provider name (e.g. "gemini", "openrouter", "ollama")
+    pub provider: String,
+    /// Model identifier for the provider
+    pub model: String,
+    /// System prompt defining the agent's role and capabilities
+    #[serde(default)]
+    pub system_prompt: Option<String>,
+    /// Optional API key override (uses default if not set).
+    /// Stored encrypted when `secrets.encrypt = true`.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Temperature override (uses 0.7 if not set)
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    /// Maximum delegation depth to prevent infinite recursion (default: 3)
+    #[serde(default = "default_max_delegation_depth")]
+    pub max_depth: u32,
+}
+
+fn default_max_delegation_depth() -> u32 {
+    3
 }
 
 // ── Gateway security ─────────────────────────────────────────────
@@ -700,6 +747,7 @@ pub struct ChannelsConfig {
     pub whatsapp: Option<WhatsAppConfig>,
     pub email: Option<crate::channels::email_channel::EmailConfig>,
     pub irc: Option<IrcConfig>,
+    pub lark: Option<LarkConfig>,
 }
 
 impl Default for ChannelsConfig {
@@ -715,6 +763,7 @@ impl Default for ChannelsConfig {
             whatsapp: None,
             email: None,
             irc: None,
+            lark: None,
         }
     }
 }
@@ -731,6 +780,10 @@ pub struct DiscordConfig {
     pub guild_id: Option<String>,
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// When true, process messages from other bots (not just humans).
+    /// The bot still ignores its own messages to prevent feedback loops.
+    #[serde(default)]
+    pub listen_to_bots: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -809,6 +862,28 @@ fn default_irc_port() -> u16 {
     6697
 }
 
+/// Lark/Feishu configuration for messaging integration
+/// Lark is the international version, Feishu is the Chinese version
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LarkConfig {
+    /// App ID from Lark/Feishu developer console
+    pub app_id: String,
+    /// App Secret from Lark/Feishu developer console
+    pub app_secret: String,
+    /// Encrypt key for webhook message decryption (optional)
+    #[serde(default)]
+    pub encrypt_key: Option<String>,
+    /// Verification token for webhook validation (optional)
+    #[serde(default)]
+    pub verification_token: Option<String>,
+    /// Allowed user IDs or union IDs (empty = deny all, "*" = allow all)
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Whether to use the Feishu (Chinese) endpoint instead of Lark (International)
+    #[serde(default)]
+    pub use_feishu: bool,
+}
+
 // ── Config impl ──────────────────────────────────────────────────
 
 impl Default for Config {
@@ -822,7 +897,7 @@ impl Default for Config {
             config_path: zeroclaw_dir.join("config.toml"),
             api_key: None,
             default_provider: Some("openrouter".to_string()),
-            default_model: Some("anthropic/claude-sonnet-4-20250514".to_string()),
+            default_model: Some("anthropic/claude-sonnet-4".to_string()),
             default_temperature: 0.7,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
@@ -838,6 +913,7 @@ impl Default for Config {
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             identity: IdentityConfig::default(),
+            agents: HashMap::new(),
         }
     }
 }
@@ -864,6 +940,19 @@ impl Config {
             // Set computed paths that are skipped during serialization
             config.config_path = config_path.clone();
             config.workspace_dir = zeroclaw_dir.join("workspace");
+
+            // Decrypt agent API keys if encryption is enabled
+            let store = crate::security::SecretStore::new(&zeroclaw_dir, config.secrets.encrypt);
+            for agent in config.agents.values_mut() {
+                if let Some(ref encrypted_key) = agent.api_key {
+                    agent.api_key = Some(
+                        store
+                            .decrypt(encrypted_key)
+                            .context("Failed to decrypt agent API key")?,
+                    );
+                }
+            }
+
             Ok(config)
         } else {
             let mut config = Config::default();
@@ -923,6 +1012,11 @@ impl Config {
             }
         }
 
+        // Allow public bind: ZEROCLAW_ALLOW_PUBLIC_BIND
+        if let Ok(val) = std::env::var("ZEROCLAW_ALLOW_PUBLIC_BIND") {
+            self.gateway.allow_public_bind = val == "1" || val.eq_ignore_ascii_case("true");
+        }
+
         // Temperature: ZEROCLAW_TEMPERATURE
         if let Ok(temp_str) = std::env::var("ZEROCLAW_TEMPERATURE") {
             if let Ok(temp) = temp_str.parse::<f64>() {
@@ -934,7 +1028,27 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<()> {
-        let toml_str = toml::to_string_pretty(self).context("Failed to serialize config")?;
+        // Encrypt agent API keys before serialization
+        let mut config_to_save = self.clone();
+        let zeroclaw_dir = self
+            .config_path
+            .parent()
+            .context("Config path must have a parent directory")?;
+        let store = crate::security::SecretStore::new(zeroclaw_dir, self.secrets.encrypt);
+        for agent in config_to_save.agents.values_mut() {
+            if let Some(ref plaintext_key) = agent.api_key {
+                if !crate::security::SecretStore::is_encrypted(plaintext_key) {
+                    agent.api_key = Some(
+                        store
+                            .encrypt(plaintext_key)
+                            .context("Failed to encrypt agent API key")?,
+                    );
+                }
+            }
+        }
+
+        let toml_str =
+            toml::to_string_pretty(&config_to_save).context("Failed to serialize config")?;
 
         let parent_dir = self
             .config_path
@@ -1019,6 +1133,7 @@ fn sync_directory(_path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use tempfile::TempDir;
 
     // ── Defaults ─────────────────────────────────────────────
 
@@ -1143,6 +1258,7 @@ mod tests {
                 whatsapp: None,
                 email: None,
                 irc: None,
+                lark: None,
             },
             memory: MemoryConfig::default(),
             tunnel: TunnelConfig::default(),
@@ -1151,6 +1267,7 @@ mod tests {
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             identity: IdentityConfig::default(),
+            agents: HashMap::new(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -1222,6 +1339,7 @@ default_temperature = 0.7
             secrets: SecretsConfig::default(),
             browser: BrowserConfig::default(),
             identity: IdentityConfig::default(),
+            agents: HashMap::new(),
         };
 
         config.save().unwrap();
@@ -1287,6 +1405,7 @@ default_temperature = 0.7
             bot_token: "discord-token".into(),
             guild_id: Some("12345".into()),
             allowed_users: vec![],
+            listen_to_bots: false,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -1300,6 +1419,7 @@ default_temperature = 0.7
             bot_token: "tok".into(),
             guild_id: None,
             allowed_users: vec![],
+            listen_to_bots: false,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -1389,6 +1509,7 @@ default_temperature = 0.7
             whatsapp: None,
             email: None,
             irc: None,
+            lark: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -1547,6 +1668,7 @@ channel_id = "C123"
             }),
             email: None,
             irc: None,
+            lark: None,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -1979,5 +2101,238 @@ default_temperature = 0.7
         assert!(g.require_pairing);
         assert!(!g.allow_public_bind);
         assert!(g.paired_tokens.is_empty());
+    }
+
+    // ── Lark config ───────────────────────────────────────────────
+
+    #[test]
+    fn lark_config_serde() {
+        let lc = LarkConfig {
+            app_id: "cli_123456".into(),
+            app_secret: "secret_abc".into(),
+            encrypt_key: Some("encrypt_key".into()),
+            verification_token: Some("verify_token".into()),
+            allowed_users: vec!["user_123".into(), "user_456".into()],
+            use_feishu: true,
+        };
+        let json = serde_json::to_string(&lc).unwrap();
+        let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.app_id, "cli_123456");
+        assert_eq!(parsed.app_secret, "secret_abc");
+        assert_eq!(parsed.encrypt_key.as_deref(), Some("encrypt_key"));
+        assert_eq!(parsed.verification_token.as_deref(), Some("verify_token"));
+        assert_eq!(parsed.allowed_users.len(), 2);
+        assert!(parsed.use_feishu);
+    }
+
+    #[test]
+    fn lark_config_toml_roundtrip() {
+        let lc = LarkConfig {
+            app_id: "cli_123456".into(),
+            app_secret: "secret_abc".into(),
+            encrypt_key: Some("encrypt_key".into()),
+            verification_token: Some("verify_token".into()),
+            allowed_users: vec!["*".into()],
+            use_feishu: false,
+        };
+        let toml_str = toml::to_string(&lc).unwrap();
+        let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.app_id, "cli_123456");
+        assert_eq!(parsed.app_secret, "secret_abc");
+        assert!(!parsed.use_feishu);
+    }
+
+    #[test]
+    fn lark_config_deserializes_without_optional_fields() {
+        let json = r#"{"app_id":"cli_123","app_secret":"secret"}"#;
+        let parsed: LarkConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.encrypt_key.is_none());
+        assert!(parsed.verification_token.is_none());
+        assert!(parsed.allowed_users.is_empty());
+        assert!(!parsed.use_feishu);
+    }
+
+    #[test]
+    fn lark_config_defaults_to_lark_endpoint() {
+        let json = r#"{"app_id":"cli_123","app_secret":"secret"}"#;
+        let parsed: LarkConfig = serde_json::from_str(json).unwrap();
+        assert!(
+            !parsed.use_feishu,
+            "use_feishu should default to false (Lark)"
+        );
+    }
+
+    #[test]
+    fn lark_config_with_wildcard_allowed_users() {
+        let json = r#"{"app_id":"cli_123","app_secret":"secret","allowed_users":["*"]}"#;
+        let parsed: LarkConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.allowed_users, vec!["*"]);
+    }
+
+    // ══════════════════════════════════════════════════════════
+    // AGENT DELEGATION CONFIG TESTS
+    // ══════════════════════════════════════════════════════════
+
+    #[test]
+    fn agents_config_default_empty() {
+        let c = Config::default();
+        assert!(c.agents.is_empty());
+    }
+
+    #[test]
+    fn agents_config_backward_compat_missing_section() {
+        let minimal = r#"
+workspace_dir = "/tmp/ws"
+config_path = "/tmp/config.toml"
+default_temperature = 0.7
+"#;
+        let parsed: Config = toml::from_str(minimal).unwrap();
+        assert!(parsed.agents.is_empty());
+    }
+
+    #[test]
+    fn agents_config_toml_roundtrip() {
+        let toml_str = r#"
+default_temperature = 0.7
+
+[agents.researcher]
+provider = "gemini"
+model = "gemini-2.0-flash"
+system_prompt = "You are a research assistant."
+max_depth = 2
+
+[agents.coder]
+provider = "openrouter"
+model = "anthropic/claude-sonnet-4-20250514"
+"#;
+        let parsed: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(parsed.agents.len(), 2);
+
+        let researcher = &parsed.agents["researcher"];
+        assert_eq!(researcher.provider, "gemini");
+        assert_eq!(researcher.model, "gemini-2.0-flash");
+        assert_eq!(
+            researcher.system_prompt.as_deref(),
+            Some("You are a research assistant.")
+        );
+        assert_eq!(researcher.max_depth, 2);
+        assert!(researcher.api_key.is_none());
+        assert!(researcher.temperature.is_none());
+
+        let coder = &parsed.agents["coder"];
+        assert_eq!(coder.provider, "openrouter");
+        assert_eq!(coder.model, "anthropic/claude-sonnet-4-20250514");
+        assert!(coder.system_prompt.is_none());
+        assert_eq!(coder.max_depth, 3); // default
+    }
+
+    #[test]
+    fn agents_config_with_api_key_and_temperature() {
+        let toml_str = r#"
+[agents.fast]
+provider = "groq"
+model = "llama-3.3-70b-versatile"
+api_key = "gsk-test-key"
+temperature = 0.3
+"#;
+        let parsed: HashMap<String, DelegateAgentConfig> = toml::from_str::<toml::Value>(toml_str)
+            .unwrap()["agents"]
+            .clone()
+            .try_into()
+            .unwrap();
+        let fast = &parsed["fast"];
+        assert_eq!(fast.api_key.as_deref(), Some("gsk-test-key"));
+        assert!((fast.temperature.unwrap() - 0.3).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn agent_api_key_encrypted_on_save_and_decrypted_on_load() {
+        let tmp = TempDir::new().unwrap();
+        let zeroclaw_dir = tmp.path();
+        let config_path = zeroclaw_dir.join("config.toml");
+
+        // Create a config with a plaintext agent API key
+        let mut agents = HashMap::new();
+        agents.insert(
+            "test_agent".to_string(),
+            DelegateAgentConfig {
+                provider: "openrouter".to_string(),
+                model: "test-model".to_string(),
+                system_prompt: None,
+                api_key: Some("sk-super-secret".to_string()),
+                temperature: None,
+                max_depth: 3,
+            },
+        );
+        let mut config = Config {
+            config_path: config_path.clone(),
+            workspace_dir: zeroclaw_dir.join("workspace"),
+            secrets: SecretsConfig { encrypt: true },
+            agents,
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        config.save().unwrap();
+
+        // Read the raw TOML and verify the key is encrypted (not plaintext)
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !raw.contains("sk-super-secret"),
+            "Plaintext API key should not appear in saved config"
+        );
+        assert!(
+            raw.contains("enc2:"),
+            "Encrypted key should use enc2: prefix"
+        );
+
+        // Parse and decrypt — simulate load_or_init by reading + decrypting
+        let store = crate::security::SecretStore::new(zeroclaw_dir, true);
+        let mut loaded: Config = toml::from_str(&raw).unwrap();
+        for agent in loaded.agents.values_mut() {
+            if let Some(ref encrypted_key) = agent.api_key {
+                agent.api_key = Some(store.decrypt(encrypted_key).unwrap());
+            }
+        }
+        assert_eq!(
+            loaded.agents["test_agent"].api_key.as_deref(),
+            Some("sk-super-secret"),
+            "Decrypted key should match original"
+        );
+    }
+
+    #[test]
+    fn agent_api_key_not_encrypted_when_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let zeroclaw_dir = tmp.path();
+        let config_path = zeroclaw_dir.join("config.toml");
+
+        let mut agents = HashMap::new();
+        agents.insert(
+            "test_agent".to_string(),
+            DelegateAgentConfig {
+                provider: "openrouter".to_string(),
+                model: "test-model".to_string(),
+                system_prompt: None,
+                api_key: Some("sk-plaintext-ok".to_string()),
+                temperature: None,
+                max_depth: 3,
+            },
+        );
+        let config = Config {
+            config_path: config_path.clone(),
+            workspace_dir: zeroclaw_dir.join("workspace"),
+            secrets: SecretsConfig { encrypt: false },
+            agents,
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        config.save().unwrap();
+
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            raw.contains("sk-plaintext-ok"),
+            "With encryption disabled, key should remain plaintext"
+        );
+        assert!(!raw.contains("enc2:"), "No encryption prefix when disabled");
     }
 }

@@ -34,6 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
+use uuid::Uuid;
 
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
@@ -41,6 +42,14 @@ pub const MAX_BODY_SIZE: usize = 65_536;
 pub const REQUEST_TIMEOUT_SECS: u64 = 300;
 /// Sliding window used by gateway rate limiting.
 pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
+
+fn webhook_memory_key() -> String {
+    format!("webhook_msg_{}", Uuid::new_v4())
+}
+
+fn whatsapp_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
+    format!("whatsapp_{}_{}", msg.sender, msg.id)
+}
 
 #[derive(Debug)]
 struct SlidingWindowRateLimiter {
@@ -196,7 +205,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let model = config
         .default_model
         .clone()
-        .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
+        .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
     let provider: Arc<dyn Provider> = Arc::from(providers::create_routed_provider(
         config.default_provider.as_deref().unwrap_or("openrouter"),
         config.api_key.as_deref(),
@@ -231,6 +240,8 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         mem.clone(),
         composio_key,
         &config.browser,
+        &config.agents,
+        config.api_key.as_deref(),
     ));
 
     // Build system prompt with tool instructions
@@ -572,9 +583,10 @@ async fn handle_webhook(
     let sender_id = &webhook_body.sender_id;
 
     if state.auto_save {
+        let key = webhook_memory_key();
         let _ = state
             .mem
-            .store("webhook_msg", message, MemoryCategory::Conversation)
+            .store(&key, message, MemoryCategory::Conversation)
             .await;
     }
 
@@ -794,13 +806,10 @@ async fn handle_whatsapp_message(
 
         // Auto-save to memory
         if state.auto_save {
+            let key = whatsapp_memory_key(msg);
             let _ = state
                 .mem
-                .store(
-                    &format!("whatsapp_{}", msg.sender),
-                    &msg.content,
-                    MemoryCategory::Conversation,
-                )
+                .store(&key, &msg.content, MemoryCategory::Conversation)
                 .await;
         }
 
@@ -835,6 +844,7 @@ async fn handle_whatsapp_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channels::traits::ChannelMessage;
     use crate::memory::{Memory, MemoryCategory, MemoryEntry};
     use crate::observability::NoopObserver;
     use crate::providers::Provider;
@@ -843,6 +853,7 @@ mod tests {
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     #[test]
     fn security_body_limit_is_64kb() {
@@ -896,6 +907,30 @@ mod tests {
         assert!(store.record_if_new("req-1"));
         assert!(!store.record_if_new("req-1"));
         assert!(store.record_if_new("req-2"));
+    }
+
+    #[test]
+    fn webhook_memory_key_is_unique() {
+        let key1 = webhook_memory_key();
+        let key2 = webhook_memory_key();
+
+        assert!(key1.starts_with("webhook_msg_"));
+        assert!(key2.starts_with("webhook_msg_"));
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn whatsapp_memory_key_includes_sender_and_message_id() {
+        let msg = ChannelMessage {
+            id: "wamid-123".into(),
+            sender: "+1234567890".into(),
+            content: "hello".into(),
+            channel: "whatsapp".into(),
+            timestamp: 1,
+        };
+
+        let key = whatsapp_memory_key(&msg);
+        assert_eq!(key, "whatsapp_+1234567890_wamid-123");
     }
 
     #[derive(Default)]
@@ -963,6 +998,63 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct TrackingMemory {
+        keys: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl Memory for TrackingMemory {
+        fn name(&self) -> &str {
+            "tracking"
+        }
+
+        async fn store(
+            &self,
+            key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+        ) -> anyhow::Result<()> {
+            self.keys
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(key.to_string());
+            Ok(())
+        }
+
+        async fn recall(&self, _query: &str, _limit: usize) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn get(&self, _key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            Ok(Vec::new())
+        }
+
+        async fn forget(&self, _key: &str) -> anyhow::Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> anyhow::Result<usize> {
+            let size = self
+                .keys
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len();
+            Ok(size)
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
     #[tokio::test]
     async fn webhook_idempotency_skips_duplicate_provider_calls() {
         let provider_impl = Arc::new(MockProvider::default());
@@ -1015,6 +1107,66 @@ mod tests {
         assert_eq!(parsed["status"], "duplicate");
         assert_eq!(parsed["idempotent"], true);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_autosave_stores_distinct_keys_per_request() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+
+        let tracking_impl = Arc::new(TrackingMemory::default());
+        let memory: Arc<dyn Memory> = tracking_impl.clone();
+
+        let state = AppState {
+            provider,
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: memory,
+            auto_save: true,
+            webhook_secret: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300))),
+            whatsapp: None,
+            whatsapp_app_secret: None,
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::from("test"),
+            conversations: Arc::new(DashMap::new()),
+        };
+
+        let headers = HeaderMap::new();
+
+        let body1 = Ok(Json(WebhookBody {
+            message: "hello one".into(),
+            sender_id: "test".into(),
+            model: None,
+        }));
+        let first = handle_webhook(State(state.clone()), headers.clone(), body1)
+            .await
+            .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let body2 = Ok(Json(WebhookBody {
+            message: "hello two".into(),
+            sender_id: "test".into(),
+            model: None,
+        }));
+        let second = handle_webhook(State(state), headers, body2)
+            .await
+            .into_response();
+        assert_eq!(second.status(), StatusCode::OK);
+
+        let keys = tracking_impl
+            .keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(keys.len(), 2);
+        assert_ne!(keys[0], keys[1]);
+        assert!(keys[0].starts_with("webhook_msg_"));
+        assert!(keys[1].starts_with("webhook_msg_"));
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 2);
     }
 
     // ══════════════════════════════════════════════════════════

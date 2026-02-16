@@ -48,8 +48,19 @@ impl OpenAiCompatibleProvider {
     /// This allows custom providers with non-standard endpoints (e.g., VolcEngine ARK uses
     /// `/api/coding/v3/chat/completions` instead of `/v1/chat/completions`).
     fn chat_completions_url(&self) -> String {
-        // If base_url already contains "chat/completions", use it as-is
-        if self.base_url.contains("chat/completions") {
+        let has_full_endpoint = reqwest::Url::parse(&self.base_url)
+            .map(|url| {
+                url.path()
+                    .trim_end_matches('/')
+                    .ends_with("/chat/completions")
+            })
+            .unwrap_or_else(|_| {
+                self.base_url
+                    .trim_end_matches('/')
+                    .ends_with("/chat/completions")
+            });
+
+        if has_full_endpoint {
             self.base_url.clone()
         } else {
             format!("{}/chat/completions", self.base_url)
@@ -306,7 +317,12 @@ impl Provider for OpenAiCompatibleProvider {
             .map(|c| {
                 // If tool_calls are present, serialize the full message as JSON
                 // so parse_tool_calls can handle the OpenAI-style format
-                if c.message.tool_calls.is_some() && c.message.tool_calls.as_ref().map_or(false, |t| !t.is_empty()) {
+                if c.message.tool_calls.is_some()
+                    && c.message
+                        .tool_calls
+                        .as_ref()
+                        .map_or(false, |t| !t.is_empty())
+                {
                     serde_json::to_string(&c.message)
                         .unwrap_or_else(|_| c.message.content.unwrap_or_default())
                 } else {
@@ -388,7 +404,12 @@ impl Provider for OpenAiCompatibleProvider {
             .map(|c| {
                 // If tool_calls are present, serialize the full message as JSON
                 // so parse_tool_calls can handle the OpenAI-style format
-                if c.message.tool_calls.is_some() && c.message.tool_calls.as_ref().map_or(false, |t| !t.is_empty()) {
+                if c.message.tool_calls.is_some()
+                    && c.message
+                        .tool_calls
+                        .as_ref()
+                        .map_or(false, |t| !t.is_empty())
+                {
                     serde_json::to_string(&c.message)
                         .unwrap_or_else(|_| c.message.content.unwrap_or_default())
                 } else {
@@ -467,7 +488,10 @@ mod tests {
     fn response_deserializes() {
         let json = r#"{"choices":[{"message":{"content":"Hello from Venice!"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.choices[0].message.content, Some("Hello from Venice!".to_string()));
+        assert_eq!(
+            resp.choices[0].message.content,
+            Some("Hello from Venice!".to_string())
+        );
     }
 
     #[test]
@@ -602,6 +626,19 @@ mod tests {
         assert_eq!(
             p.chat_completions_url(),
             "https://my-api.example.com/v2/llm/chat/completions"
+        );
+    }
+
+    #[test]
+    fn chat_completions_url_requires_exact_suffix_match() {
+        let p = make_provider(
+            "custom",
+            "https://my-api.example.com/v2/llm/chat/completions-proxy",
+            None,
+        );
+        assert_eq!(
+            p.chat_completions_url(),
+            "https://my-api.example.com/v2/llm/chat/completions-proxy/chat/completions"
         );
     }
 
