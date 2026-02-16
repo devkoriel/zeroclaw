@@ -334,6 +334,30 @@ impl SecurityPolicy {
         false
     }
 
+    /// Commands that would kill the daemon process itself.
+    /// These are blocked unconditionally — the `self_upgrade` tool provides
+    /// a safe alternative that builds, deploys, and restarts via a detached process.
+    pub fn is_self_destructive(command: &str) -> bool {
+        let lower = command.to_ascii_lowercase();
+
+        // launchctl bootout / unload kills the daemon process
+        if lower.contains("launchctl bootout") || lower.contains("launchctl unload") {
+            return true;
+        }
+
+        // deploy.sh calls launchctl bootout internally — child process dies with parent
+        if lower.contains("deploy.sh") {
+            return true;
+        }
+
+        // killall / pkill / kill targeting zeroclaw
+        if (lower.contains("killall") || lower.contains("pkill")) && lower.contains("zeroclaw") {
+            return true;
+        }
+
+        false
+    }
+
     /// Validate full command execution policy (allowlist + risk gate).
     ///
     /// Returns `APPROVAL_REQUIRED` errors for medium/high-risk commands when
@@ -345,6 +369,17 @@ impl SecurityPolicy {
     ) -> Result<CommandRiskLevel, String> {
         if !self.is_command_allowed(command) {
             return Err(format!("Command not allowed by security policy: {command}"));
+        }
+
+        // Block daemon lifecycle commands — running these kills the daemon process.
+        // The self_upgrade tool handles restart safely via a detached nohup process.
+        if Self::is_self_destructive(command) {
+            return Err(
+                "BLOCKED: This command would kill the daemon process. \
+                 Use the `self_upgrade` tool instead — it handles build, deploy, \
+                 and restart safely without killing yourself."
+                    .into(),
+            );
         }
 
         // Catastrophic commands are permanently blocked, no approval override
@@ -838,6 +873,45 @@ mod tests {
                 "Expected Medium for: {cmd}"
             );
         }
+    }
+
+    // ── is_self_destructive ────────────────────────────────
+
+    #[test]
+    fn self_destructive_blocks_launchctl_bootout() {
+        assert!(SecurityPolicy::is_self_destructive("launchctl bootout gui/501 com.zeroclaw.daemon.plist"));
+        assert!(SecurityPolicy::is_self_destructive("launchctl unload ~/Library/LaunchAgents/com.zeroclaw.daemon.plist"));
+    }
+
+    #[test]
+    fn self_destructive_blocks_deploy_script() {
+        assert!(SecurityPolicy::is_self_destructive("bash scripts/deploy.sh"));
+        assert!(SecurityPolicy::is_self_destructive("bash ~/Development/zeroclaw/scripts/deploy.sh"));
+    }
+
+    #[test]
+    fn self_destructive_blocks_kill_zeroclaw() {
+        assert!(SecurityPolicy::is_self_destructive("killall zeroclaw"));
+        assert!(SecurityPolicy::is_self_destructive("pkill zeroclaw"));
+    }
+
+    #[test]
+    fn self_destructive_allows_safe_commands() {
+        assert!(!SecurityPolicy::is_self_destructive("cargo build --release"));
+        assert!(!SecurityPolicy::is_self_destructive("launchctl print gui/501/com.zeroclaw.daemon"));
+        assert!(!SecurityPolicy::is_self_destructive("echo hello"));
+    }
+
+    #[test]
+    fn validate_blocks_self_destructive_even_with_approval() {
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["launchctl".into()],
+            ..SecurityPolicy::default()
+        };
+        let result = p.validate_command_execution("launchctl bootout gui/501 com.zeroclaw.daemon.plist", true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("self_upgrade"));
     }
 
     // ── is_path_allowed ─────────────────────────────────────

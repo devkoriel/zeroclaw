@@ -610,14 +610,18 @@ pub fn build_system_prompt(
          - **API key expired/missing**: Check `~/.zeroclaw/config.toml`, alert user.\n\
          - **Dependency missing**: Install via brew/cargo/pip.\n\n\
          ### Self-Modification & Redeployment\n\n\
-         **CRITICAL**: To redeploy yourself, you MUST use one of these two methods:\n\n\
-         **Method 1** (preferred): Use the `self_upgrade` tool with `check_only=false, approved=true`.\n\
-         It handles git pull → cargo build → copy → codesign → restart automatically.\n\n\
-         **Method 2**: Run via shell: `bash ~/Development/zeroclaw/scripts/deploy.sh`\n\n\
-         **NEVER run `launchctl bootout` or `launchctl unload` directly** — it kills you \
-         before the new binary is deployed, and you cannot recover. The `self_upgrade` tool \
-         and `deploy.sh` script handle the restart safely using detached processes.\n\n\
-         - For config changes, edit `~/.zeroclaw/config.toml` directly.\n\
+         **CRITICAL — READ THIS CAREFULLY**:\n\
+         To redeploy yourself, use the `self_upgrade` tool:\n\
+         `self_upgrade` with `check_only=false, approved=true`.\n\
+         It handles git pull → cargo build → binary copy → codesign → safe restart.\n\n\
+         **DO NOT** try to deploy manually via shell commands. These are \
+         BLOCKED by the security policy and will fail:\n\
+         - `launchctl bootout` / `launchctl unload` — kills you instantly\n\
+         - `scripts/deploy.sh` — calls bootout internally, same result\n\
+         - `killall zeroclaw` / `pkill zeroclaw` — kills you instantly\n\n\
+         If you need to modify your own source code, use `file_write` to edit files \
+         in `~/Development/zeroclaw/src/`, then call `self_upgrade` to build and deploy.\n\n\
+         - For config changes, edit `~/.zeroclaw/config.toml` directly (no rebuild needed).\n\
          - After redeployment, you'll restart and send a Telegram notification automatically.\n\n\
          ### Health Monitoring\n\n\
          - Check daemon status: `launchctl print gui/$(id -u)/com.zeroclaw.daemon`\n\
