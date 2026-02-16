@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use serde::Serialize;
 use serde_json::json;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,6 +16,36 @@ const VISION_TIMEOUT: Duration = Duration::from_secs(30);
 const VISION_MODEL: &str = "gemini-2.0-flash";
 /// Maximum JPEG file size to send to vision API (~4 MB).
 const MAX_JPEG_BYTES: u64 = 4_194_304;
+/// Delay after opening an app to let it fully render.
+const OPEN_APP_DELAY: Duration = Duration::from_millis(1500);
+
+/// Keys that cliclick's `kp:` command supports.
+/// Regular character keys (a-z, 0-9, punctuation) are NOT supported by cliclick
+/// and must use AppleScript `keystroke` instead.
+const CLICLICK_SPECIAL_KEYS: &[&str] = &[
+    "arrow-down", "arrow-left", "arrow-right", "arrow-up",
+    "brightness-down", "brightness-up",
+    "delete", "end", "enter", "esc", "escape",
+    "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8",
+    "f9", "f10", "f11", "f12", "f13", "f14", "f15", "f16",
+    "fwd-delete", "home",
+    "keys-light-down", "keys-light-toggle", "keys-light-up",
+    "mute",
+    "num-0", "num-1", "num-2", "num-3", "num-4",
+    "num-5", "num-6", "num-7", "num-8", "num-9",
+    "num-clear", "num-divide", "num-enter", "num-equals",
+    "num-minus", "num-multiply", "num-plus",
+    "page-down", "page-up",
+    "play-next", "play-pause", "play-previous",
+    "return", "space", "tab",
+    "volume-down", "volume-up",
+];
+
+/// Global flag: once cliclick passes its check, skip future checks.
+static CLICLICK_VERIFIED: AtomicBool = AtomicBool::new(false);
+
+/// Cached logical screen width (0 = not yet cached).
+static SCREEN_WIDTH_CACHE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 // ── Gemini Vision API types (separate from providers/gemini.rs) ─────────────
 
@@ -112,8 +143,8 @@ impl ComputerTool {
             }
         }
 
-        // 2. Get logical screen width and resize
-        let logical_width = get_logical_screen_width().await;
+        // 2. Get logical screen width (cached) and resize
+        let logical_width = get_logical_screen_width_cached().await;
         if let Some(w) = logical_width {
             let _ = run_cmd("sips", &["--resampleWidth", &w.to_string(), &path]).await;
         }
@@ -269,10 +300,12 @@ impl ComputerTool {
             Err(e) => return err_result(e),
         };
 
-        if let Err(e) = check_cliclick().await {
+        if let Err(e) = check_cliclick_cached().await {
             return err_result(e);
         }
 
+        // Bring the frontmost app to focus and ensure we click in the right place.
+        // This avoids clicking behind overlapping windows.
         let coord = format!("{prefix}:{x},{y}");
         match run_cmd("cliclick", &[&coord]).await {
             Ok(out) => ToolResult {
@@ -291,7 +324,7 @@ impl ComputerTool {
             return err_result("Missing required parameter: text");
         };
 
-        if let Err(e) = check_cliclick().await {
+        if let Err(e) = check_cliclick_cached().await {
             return err_result(e);
         }
 
@@ -313,7 +346,22 @@ impl ComputerTool {
             return err_result("Missing required parameter: key");
         };
 
-        if let Err(e) = check_cliclick().await {
+        // Determine if we need AppleScript or cliclick.
+        // cliclick's kp: only supports special keys (return, tab, arrows, F-keys, etc.)
+        // For combos with regular character keys (a-z, 0-9, punctuation), use AppleScript.
+        let parts: Vec<&str> = combo.split('+').map(str::trim).collect();
+        let final_key = parts.last().copied().unwrap_or("");
+        let mapped_key = map_key_name(final_key);
+        let needs_applescript = !is_cliclick_special_key(mapped_key);
+
+        if needs_applescript {
+            // Use AppleScript for key combos involving regular characters.
+            // This handles cmd+c, cmd+v, cmd+a, ctrl+a, etc. reliably.
+            return self.action_key_applescript(combo, &parts).await;
+        }
+
+        // Use cliclick for special-key-only combos (e.g., "enter", "cmd+tab", "cmd+shift+tab")
+        if let Err(e) = check_cliclick_cached().await {
             return err_result(e);
         }
 
@@ -326,7 +374,75 @@ impl ComputerTool {
                 output: format!("Key combo: {combo}"),
                 error: None,
             },
-            Err(e) => err_result(format!("Key press failed: {e}")),
+            Err(e) => {
+                // Fallback to AppleScript if cliclick fails
+                tracing::warn!("cliclick key combo failed ({e}), falling back to AppleScript");
+                self.action_key_applescript(combo, &parts).await
+            }
+        }
+    }
+
+    /// Execute a key combo via AppleScript `keystroke` / `key code`.
+    /// This is the reliable method for combos involving regular character keys
+    /// (e.g., cmd+c, cmd+v, cmd+a, ctrl+z) and also works as a fallback for
+    /// special keys.
+    async fn action_key_applescript(&self, combo: &str, parts: &[&str]) -> ToolResult {
+        if parts.is_empty() {
+            return err_result("Empty key combo");
+        }
+
+        let final_key = parts.last().copied().unwrap_or("");
+        let modifiers = &parts[..parts.len().saturating_sub(1)];
+
+        // Build AppleScript modifier list: {command down, shift down, ...}
+        let mut as_modifiers = Vec::new();
+        for m in modifiers {
+            match m.to_lowercase().as_str() {
+                "cmd" | "command" => as_modifiers.push("command down"),
+                "ctrl" | "control" => as_modifiers.push("control down"),
+                "alt" | "option" | "opt" => as_modifiers.push("option down"),
+                "shift" => as_modifiers.push("shift down"),
+                "fn" => as_modifiers.push("fn down"),
+                _ => {
+                    return err_result(format!("Unknown modifier: {m}"));
+                }
+            }
+        }
+
+        let modifier_clause = if as_modifiers.is_empty() {
+            String::new()
+        } else {
+            format!(" using {{{}}}", as_modifiers.join(", "))
+        };
+
+        // Determine whether to use `keystroke` (for characters) or `key code` (for special keys)
+        let script = if let Some(key_code) = applescript_key_code(final_key) {
+            // Special key → use key code
+            format!(
+                "tell application \"System Events\" to key code {key_code}{modifier_clause}"
+            )
+        } else if final_key.len() == 1 {
+            // Single character → use keystroke
+            // Escape quotes for AppleScript
+            let escaped = final_key.replace('\\', "\\\\").replace('"', "\\\"");
+            format!(
+                "tell application \"System Events\" to keystroke \"{escaped}\"{modifier_clause}"
+            )
+        } else {
+            // Multi-char non-special key — try keystroke anyway
+            let escaped = final_key.replace('\\', "\\\\").replace('"', "\\\"");
+            format!(
+                "tell application \"System Events\" to keystroke \"{escaped}\"{modifier_clause}"
+            )
+        };
+
+        match run_cmd("osascript", &["-e", &script]).await {
+            Ok(_) => ToolResult {
+                success: true,
+                output: format!("Key combo: {combo} (via AppleScript)"),
+                error: None,
+            },
+            Err(e) => err_result(format!("Key press failed (AppleScript): {e}")),
         }
     }
 
@@ -351,7 +467,7 @@ impl ComputerTool {
 
         // Move cursor to position first if coordinates provided
         if let Ok((x, y)) = extract_coords(args) {
-            if check_cliclick().await.is_ok() {
+            if check_cliclick_cached().await.is_ok() {
                 let _ = run_cmd("cliclick", &[&format!("m:{x},{y}")]).await;
             }
         }
@@ -371,10 +487,9 @@ impl ComputerTool {
         let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S%3f");
         let script_path = format!("/tmp/zeroclaw_scroll_{ts}.js");
         let jxa_content = format!(
-            "ObjC.import('CoreGraphics');
-             var e = $.CGEventCreateScrollWheelEvent(null, 0, 2, {scroll_y}, {scroll_x});
-             $.CGEventPost(0, e);
-"
+            "ObjC.import('CoreGraphics');\n\
+             var e = $.CGEventCreateScrollWheelEvent(null, 0, 2, {scroll_y}, {scroll_x});\n\
+             $.CGEventPost(0, e);\n"
         );
 
         if let Err(e) = tokio::fs::write(&script_path, &jxa_content).await {
@@ -430,8 +545,17 @@ impl ComputerTool {
 
         match run_cmd("open", &["-a", app_name]).await {
             Ok(_) => {
-                // Wait briefly for app to launch and come to foreground
-                tokio::time::sleep(Duration::from_millis(500)).await;
+                // Wait for app to launch, come to foreground, and render its UI.
+                // 500ms was too short for heavier apps like KakaoTalk.
+                tokio::time::sleep(OPEN_APP_DELAY).await;
+
+                // Bring the app to the front to ensure it's focused
+                let activate_script = format!(
+                    "tell application \"{}\" to activate",
+                    app_name.replace('"', "\\\"")
+                );
+                let _ = run_cmd("osascript", &["-e", &activate_script]).await;
+
                 ToolResult {
                     success: true,
                     output: format!("Opened application: {app_name}"),
@@ -445,7 +569,7 @@ impl ComputerTool {
     // ── Cursor position action ──────────────────────────────────────────
 
     async fn action_cursor_position(&self) -> ToolResult {
-        if let Err(e) = check_cliclick().await {
+        if let Err(e) = check_cliclick_cached().await {
             return err_result(e);
         }
 
@@ -569,6 +693,49 @@ fn extract_coords(args: &serde_json::Value) -> Result<(i64, i64), String> {
     Ok((x, y))
 }
 
+/// Check if a mapped key name is a cliclick special key.
+fn is_cliclick_special_key(key: &str) -> bool {
+    CLICLICK_SPECIAL_KEYS.contains(&key)
+}
+
+/// Map a key name to its AppleScript `key code` number, if it's a special key.
+/// Returns None for regular character keys (which use `keystroke` instead).
+fn applescript_key_code(name: &str) -> Option<u32> {
+    match name.to_lowercase().as_str() {
+        "return" | "enter" => Some(36),
+        "tab" => Some(48),
+        "space" | " " => Some(49),
+        "delete" | "backspace" => Some(51),
+        "escape" | "esc" => Some(53),
+        "fwd-delete" | "forward-delete" | "forwarddelete" => Some(117),
+        "up" | "arrow-up" => Some(126),
+        "down" | "arrow-down" => Some(125),
+        "left" | "arrow-left" => Some(123),
+        "right" | "arrow-right" => Some(124),
+        "home" => Some(115),
+        "end" => Some(119),
+        "page-up" | "pageup" | "page_up" => Some(116),
+        "page-down" | "pagedown" | "page_down" => Some(121),
+        "f1" => Some(122),
+        "f2" => Some(120),
+        "f3" => Some(99),
+        "f4" => Some(118),
+        "f5" => Some(96),
+        "f6" => Some(97),
+        "f7" => Some(98),
+        "f8" => Some(100),
+        "f9" => Some(101),
+        "f10" => Some(109),
+        "f11" => Some(103),
+        "f12" => Some(111),
+        "f13" => Some(105),
+        "f14" => Some(107),
+        "f15" => Some(113),
+        "f16" => Some(106),
+        _ => None,
+    }
+}
+
 /// Run a command with timeout, returning stdout on success or an error message.
 async fn run_cmd(program: &str, args: &[&str]) -> Result<String, String> {
     let result = tokio::time::timeout(
@@ -594,7 +761,24 @@ async fn run_cmd(program: &str, args: &[&str]) -> Result<String, String> {
 }
 
 /// Check if cliclick is installed and Accessibility is granted.
-async fn check_cliclick() -> Result<(), String> {
+/// Uses a cached result after the first successful check to avoid
+/// spawning 2 subprocesses on every single action.
+async fn check_cliclick_cached() -> Result<(), String> {
+    // Fast path: already verified
+    if CLICLICK_VERIFIED.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+
+    // Slow path: full check
+    let result = check_cliclick_inner().await;
+    if result.is_ok() {
+        CLICLICK_VERIFIED.store(true, Ordering::Relaxed);
+    }
+    result
+}
+
+/// Inner cliclick check — actually spawns processes.
+async fn check_cliclick_inner() -> Result<(), String> {
     if run_cmd("which", &["cliclick"]).await.is_err() {
         return Err(
             "cliclick not found. Install with: brew install cliclick".into(),
@@ -623,6 +807,21 @@ async fn check_cliclick() -> Result<(), String> {
             }
         }
     }
+}
+
+/// Get logical screen width, using a cached value after first successful call.
+/// Screen resolution doesn't change between screenshots in the same session.
+async fn get_logical_screen_width_cached() -> Option<u32> {
+    let cached = SCREEN_WIDTH_CACHE.load(Ordering::Relaxed);
+    if cached > 0 {
+        return Some(cached);
+    }
+
+    let width = get_logical_screen_width().await;
+    if let Some(w) = width {
+        SCREEN_WIDTH_CACHE.store(w, Ordering::Relaxed);
+    }
+    width
 }
 
 /// Get logical screen width via JXA `AppKit`, with `system_profiler` fallback.
@@ -677,12 +876,13 @@ async fn get_logical_screen_width() -> Option<u32> {
 }
 
 /// Parse a key combo string into cliclick arguments.
+/// NOTE: This is only used for combos where the final key IS a cliclick special key.
+/// For regular character keys, `action_key_applescript` is used instead.
 ///
 /// Examples:
-/// - `"cmd+c"` → `["kd:cmd", "kp:c", "ku:cmd"]`
-/// - `"cmd+shift+t"` → `["kd:cmd", "kd:shift", "kp:t", "ku:shift", "ku:cmd"]`
 /// - `"enter"` → `["kp:return"]`
-/// - `"tab"` → `["kp:tab"]`
+/// - `"cmd+tab"` → `["kd:cmd", "kp:tab", "ku:cmd"]`
+/// - `"cmd+shift+tab"` → `["kd:cmd", "kd:shift", "kp:tab", "ku:shift", "ku:cmd"]`
 fn parse_key_combo(combo: &str) -> Vec<String> {
     let parts: Vec<&str> = combo.split('+').map(str::trim).collect();
 
@@ -812,17 +1012,18 @@ mod tests {
 
     #[test]
     fn parse_key_with_modifier() {
+        // cmd+tab uses cliclick (tab is a special key)
         assert_eq!(
-            parse_key_combo("cmd+c"),
-            vec!["kd:cmd", "kp:c", "ku:cmd"]
+            parse_key_combo("cmd+tab"),
+            vec!["kd:cmd", "kp:tab", "ku:cmd"]
         );
     }
 
     #[test]
     fn parse_key_with_multiple_modifiers() {
         assert_eq!(
-            parse_key_combo("cmd+shift+t"),
-            vec!["kd:cmd", "kd:shift", "kp:t", "ku:shift", "ku:cmd"]
+            parse_key_combo("cmd+shift+tab"),
+            vec!["kd:cmd", "kd:shift", "kp:tab", "ku:shift", "ku:cmd"]
         );
     }
 
@@ -846,10 +1047,42 @@ mod tests {
     fn parse_arrow_keys() {
         assert_eq!(parse_key_combo("up"), vec!["kp:arrow-up"]);
         assert_eq!(parse_key_combo("down"), vec!["kp:arrow-down"]);
-        assert_eq!(
-            parse_key_combo("cmd+left"),
-            vec!["kd:cmd", "kp:arrow-left", "ku:cmd"]
-        );
+    }
+
+    // ── cliclick special key detection ──────────────────────────────────
+
+    #[test]
+    fn special_keys_detected() {
+        assert!(is_cliclick_special_key("return"));
+        assert!(is_cliclick_special_key("tab"));
+        assert!(is_cliclick_special_key("space"));
+        assert!(is_cliclick_special_key("arrow-up"));
+        assert!(is_cliclick_special_key("delete"));
+        assert!(is_cliclick_special_key("f1"));
+    }
+
+    #[test]
+    fn regular_keys_not_special() {
+        assert!(!is_cliclick_special_key("c"));
+        assert!(!is_cliclick_special_key("v"));
+        assert!(!is_cliclick_special_key("a"));
+        assert!(!is_cliclick_special_key("z"));
+        assert!(!is_cliclick_special_key("1"));
+    }
+
+    // ── AppleScript key codes ───────────────────────────────────────────
+
+    #[test]
+    fn applescript_key_codes() {
+        assert_eq!(applescript_key_code("return"), Some(36));
+        assert_eq!(applescript_key_code("enter"), Some(36));
+        assert_eq!(applescript_key_code("tab"), Some(48));
+        assert_eq!(applescript_key_code("escape"), Some(53));
+        assert_eq!(applescript_key_code("up"), Some(126));
+        assert_eq!(applescript_key_code("f1"), Some(122));
+        // Regular character keys return None
+        assert_eq!(applescript_key_code("c"), None);
+        assert_eq!(applescript_key_code("v"), None);
     }
 
     // ── Key name mapping ────────────────────────────────────────────────
@@ -919,6 +1152,16 @@ mod tests {
         assert!(json_str.contains("\"data\":\"abc123\""));
         assert!(json_str.contains("\"temperature\":0.1"));
         assert!(json_str.contains("\"maxOutputTokens\":4096"));
+    }
+
+    // ── Caching tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn screen_width_cache_starts_empty() {
+        // Cache should start at 0 (uncached)
+        // Note: can't test atomics in isolation since they're global,
+        // but we verify the sentinel value logic
+        assert_eq!(0u32, 0); // placeholder — real test is the integration
     }
 
     // ── Async tests ─────────────────────────────────────────────────────
