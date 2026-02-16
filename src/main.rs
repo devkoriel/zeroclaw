@@ -362,7 +362,8 @@ async fn main() -> Result<()> {
         Commands::Status => {
             println!("🦀 ZeroClaw Status");
             println!();
-            println!("Version:     {}", env!("CARGO_PKG_VERSION"));
+            println!("Version:     {} ({})", env!("CARGO_PKG_VERSION"), env!("ZEROCLAW_GIT_SHA"));
+            println!("Built:       {}", env!("ZEROCLAW_BUILD_TIME"));
             println!("Workspace:   {}", config.workspace_dir.display());
             println!("Config:      {}", config.config_path.display());
             println!();
