@@ -83,6 +83,58 @@ fn is_technical_task(message: &str) -> bool {
         return true;
     }
 
+    // ── macOS app / system interaction (requires tool use) ──
+    // Any request to interact with applications needs Claude for proper tool use.
+    // App names are safe (no false positives). Action verbs use multi-word
+    // phrases to avoid matching common English ("send me a summary", "open question").
+    const APP_NAMES: &[&str] = &[
+        "kakaotalk", "kakao talk", "카카오톡", "카톡",
+        "imessage", "messages app", "메시지",
+        "telegram", "텔레그램",
+        "discord", "디스코드",
+        "slack", "슬랙",
+        "mail app", "mail.app",
+        "safari", "chrome", "brave", "firefox",
+        "finder", "terminal",
+        "system preferences", "system settings",
+        "notes app", "reminders",
+        "spotify", "music app",
+        "zoom", "facetime",
+    ];
+    for app in APP_NAMES {
+        if lower.contains(app) {
+            return true;
+        }
+    }
+    // Action phrases that imply system interaction (multi-word to avoid false positives)
+    const SYSTEM_ACTIONS: &[&str] = &[
+        "send a message", "send the message", "send message",
+        "send a mail", "send the mail", "send an email", "send email",
+        "send it to", "send this to", "send to my",
+        "open the app", "open an app", "open app",
+        "launch the app", "launch app",
+        "close the app", "close app", "quit the app", "quit app",
+        "take a screenshot", "take screenshot", "capture screen",
+        "click on", "click the", "right click", "double click",
+        "type in", "type into",
+        "check my email", "check email", "check my mail", "read my email",
+        "play music", "play song", "play the ",
+        "메일 보내", "메시지 보내", "문자 보내",
+        "앱 열어", "앱 실행", "스크린샷",
+    ];
+    for action in SYSTEM_ACTIONS {
+        if lower.contains(action) {
+            return true;
+        }
+    }
+    // Memory operations need tool use → Claude
+    if lower.contains("remember this") || lower.contains("memorize")
+        || lower.contains("recall what") || lower.contains("기억해")
+        || lower.contains("저장해")
+    {
+        return true;
+    }
+
     // ── Shell / DevOps commands ──
     const SHELL_SIGNALS: &[&str] = &[
         "ssh ", "scp ", "curl ", "wget ", "docker ",

@@ -19,6 +19,10 @@ use uuid::Uuid;
 /// per action, so this must be high enough for multi-step workflows.
 pub const MAX_TOOL_ITERATIONS: usize = 25;
 
+/// Maximum characters retained per tool result to prevent a single output
+/// from dominating the conversation history budget.
+pub const MAX_TOOL_RESULT_CHARS: usize = 16_000;
+
 /// Trigger auto-compaction when non-system message count exceeds this threshold.
 /// When exceeded, the oldest messages are dropped (system prompt is always preserved).
 pub const MAX_HISTORY_MESSAGES: usize = 50;
@@ -105,7 +109,7 @@ fn apply_compaction_summary(
     history.splice(start..compact_end, std::iter::once(summary_msg));
 }
 
-async fn auto_compact_history(
+pub async fn auto_compact_history(
     history: &mut Vec<ChatMessage>,
     provider: &dyn Provider,
     model: &str,
@@ -464,10 +468,15 @@ pub async fn agent_turn(
                 format!("Unknown tool: {}", call.name)
             };
 
+            let capped = if result.len() > MAX_TOOL_RESULT_CHARS {
+                truncate_with_ellipsis(&result, MAX_TOOL_RESULT_CHARS)
+            } else {
+                result
+            };
             let _ = writeln!(
                 tool_results,
                 "<tool_result name=\"{}\">\n{}\n</tool_result>",
-                call.name, result
+                call.name, capped
             );
         }
 
@@ -640,6 +649,7 @@ pub async fn run(
         &skills,
         Some(&config.identity),
         &config.model_routes,
+        Some(&config.autonomy),
     );
 
     // Append structured tool-use instructions with schemas

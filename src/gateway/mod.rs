@@ -8,7 +8,8 @@
 //! - Header sanitization (handled by axum/hyper)
 
 use crate::agent::loop_::{
-    agent_turn, build_context, build_tool_instructions, trim_history, trim_history_by_size,
+    agent_turn, auto_compact_history, build_context, build_tool_instructions, trim_history,
+    trim_history_by_size,
 };
 use crate::channels::{build_system_prompt, Channel, WhatsAppChannel};
 use crate::config::Config;
@@ -265,6 +266,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         &loaded_skills,
         Some(&config.identity),
         &config.model_routes,
+        Some(&config.autonomy),
     );
     system_prompt_str.push_str(&build_tool_instructions(&tools_registry));
     let system_prompt: Arc<str> = Arc::from(system_prompt_str);
@@ -665,6 +667,13 @@ async fn handle_webhook(
     .await
     {
         Ok(response) => {
+            // Intelligent compaction before hard trim preserves context signal
+            let _ = auto_compact_history(
+                &mut history,
+                state.provider.as_ref(),
+                &selected_model,
+            )
+            .await;
             trim_history(&mut history);
             trim_history_by_size(&mut history);
             let subject = crate::agent::routing::extract_subject(&history);
@@ -676,6 +685,18 @@ async fn handle_webhook(
                 .mem
                 .save_conversation(&sender_id, &history_json, subject.as_deref())
                 .await;
+
+            // Auto-save assistant response to searchable memory so it
+            // survives history trimming and can be recalled after restart.
+            if state.auto_save {
+                let resp_key = format!("assistant_resp_{}", Uuid::new_v4());
+                let resp_summary =
+                    crate::util::truncate_with_ellipsis(&response, 4000);
+                let _ = state
+                    .mem
+                    .store(&resp_key, &resp_summary, MemoryCategory::Conversation)
+                    .await;
+            }
 
             // Channel-specific formatting applied at the gateway so the relay
             // receives pre-formatted text and doesn't need its own converter.
@@ -720,6 +741,12 @@ async fn handle_webhook(
                 "Something went wrong processing your request. Please try again.".to_string()
             };
 
+            let _ = auto_compact_history(
+                &mut history,
+                state.provider.as_ref(),
+                &selected_model,
+            )
+            .await;
             trim_history(&mut history);
             trim_history_by_size(&mut history);
             let subject = crate::agent::routing::extract_subject(&history);
@@ -1225,10 +1252,13 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        assert_eq!(keys.len(), 2);
-        assert_ne!(keys[0], keys[1]);
-        assert!(keys[0].starts_with("webhook_msg_"));
-        assert!(keys[1].starts_with("webhook_msg_"));
+        // 2 user messages + 2 assistant responses = 4 entries
+        assert_eq!(keys.len(), 4);
+        let user_keys: Vec<_> = keys.iter().filter(|k| k.starts_with("webhook_msg_")).collect();
+        let resp_keys: Vec<_> = keys.iter().filter(|k| k.starts_with("assistant_resp_")).collect();
+        assert_eq!(user_keys.len(), 2);
+        assert_eq!(resp_keys.len(), 2);
+        assert_ne!(user_keys[0], user_keys[1]);
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 2);
     }
 
